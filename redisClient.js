@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { createClient } = require('redis');
-
+const { generateEmbedding } = require('./geminiClient'); 
 const redis = createClient({ url: process.env.REDIS_URL });
 redis.connect();
 
@@ -19,11 +19,34 @@ async function articleExists(id) {
 async function createSearchIndex() {
   try {
     // Check if index already exists
-    const indexExists = await redis.ft.info('idx:news').catch(() => false);
-    if (indexExists) {
-      console.log('Search index already exists');
-      return;
+    // const indexExists = await redis.ft.info('idx:news').catch(() => false);
+    // if (indexExists) {
+    //   console.log('Search index already exists');
+    //   return;
+    // }
+
+    // Drop existing index if it exists (in case of schema changes)
+    try {
+      await redis.ft.dropIndex('idx:news');
+      console.log('Dropped existing index to recreate with new schema');
+    } catch (e) {
+      // Index doesn't exist, that's fine
     }
+
+    // // Get actual embedding dimension from a sample article
+    // let embeddingDimension = 3072; // Default
+    // try {
+    //   const sampleKey = await redis.keys('news:*').then(keys => keys[0]);
+    //   if (sampleKey) {
+    //     const sampleArticle = await redis.json.get(sampleKey);
+    //     if (sampleArticle && sampleArticle.vector) {
+    //       embeddingDimension = sampleArticle.vector.length;
+    //       console.log(`Detected embedding dimension: ${embeddingDimension}`);
+    //     }
+    //   }
+    // } catch (e) {
+    //   console.log('Could not detect embedding dimension, using default:', embeddingDimension);
+    // }
 
     console.log('Creating enhanced RedisSearch index...');
     await redis.ft.create('idx:news', {
@@ -44,10 +67,21 @@ async function createSearchIndex() {
         AS: 'summary'
       },
       '$.sentiment': { type: 'TAG', AS: 'sentiment' },
+      '$.keywords': { type: 'TAG', AS: 'keywords' },
       '$.source.name': { type: 'TAG', AS: 'source' },
       '$.publishedAt': { type: 'TEXT', AS: 'publishedAt' },
       '$.category': { type: 'TAG', AS: 'category' },
-      '$.id': { type: 'TAG', AS: 'article_id' }
+      '$.id': { type: 'TAG', AS: 'article_id' },
+      '$.urlToImage': { type: 'TEXT', AS: 'urlToImage' },
+      '$.url': { type: 'TEXT', AS: 'url' },
+      '$.vector': { 
+        type: 'VECTOR', 
+        AS: 'vector', 
+        ALGORITHM: 'FLAT', 
+        TYPE: 'FLOAT32',
+        DIM: 3072, 
+        DISTANCE_METRIC: 'COSINE' 
+      }
     }, { 
       ON: 'JSON', 
       PREFIX: 'news:'
@@ -60,6 +94,234 @@ async function createSearchIndex() {
     } else {
       console.error('Error creating search index:', error);
     }
+  }
+}
+
+async function vectorSearchSimilarNews(searchText, limit = 10, threshold = 0.7, filters = {}, excludeId = null) {
+  try {
+    console.log(`Searching for similar news to: "${searchText}"`);
+    
+    // Generate embedding for the search text using Gemini
+    const searchVector = await generateEmbedding(searchText);
+    
+    if (!searchVector || !Array.isArray(searchVector)) {
+      throw new Error('Failed to generate embedding for search text');
+    }
+
+    console.log(`Generated embedding with dimension: ${searchVector.length}`);
+
+    // Build the vector similarity query
+    let baseQuery = `*=>[KNN ${limit * 2} @vector $BLOB AS vector_score]`;
+    const queryFilters = [];
+
+    // Add filters if provided
+    if (filters.category) {
+      queryFilters.push(`@category:{${filters.category}}`);
+    }
+    if (filters.source) {
+      queryFilters.push(`@source:{${filters.source}}`);
+    }
+    if (filters.sentiment) {
+      queryFilters.push(`@sentiment:{${filters.sentiment}}`);
+    }
+
+    // Exclude specific article ID if provided
+    if (excludeId) {
+      queryFilters.push(`-@article_id:{${excludeId}}`);
+    }
+
+    // Combine filters with base query
+    let finalQuery = baseQuery;
+    if (queryFilters.length > 0) {
+      finalQuery = `(${queryFilters.join(' ')})=>[KNN ${limit * 2} @vector $BLOB AS vector_score]`;
+    }
+
+    // Prepare the vector search parameters
+    const vectorQuery = Buffer.from(new Float32Array(searchVector).buffer);
+
+    // Perform vector similarity search
+    const searchResults = await redis.ft.search('idx:news', finalQuery, {
+      PARAMS: {
+        BLOB: vectorQuery
+      },
+      SORTBY: {
+        BY: 'vector_score',
+        DIRECTION: 'ASC' // Lower scores mean higher similarity in cosine distance
+      },
+      RETURN: [
+        'title', 'description', 'content', 'summary', 'sentiment', 
+        'source', 'publishedAt', 'category', 'article_id', 'urlToImage', 'url', 'vector_score'
+      ],
+      LIMIT: {
+        from: 0,
+        size: limit * 2 // Get more results to filter by threshold
+      },
+      DIALECT: 2
+    });
+    console.log(searchResults);
+
+    // Process and filter results
+    const similarArticles = [];
+    
+    if (searchResults && searchResults.documents) {
+      for (const doc of searchResults.documents) {
+        const score = parseFloat(doc.value.vector_score || 1);
+        const similarity = 1 - score; // Convert distance to similarity (higher is more similar)
+        console.log(similarity);
+        // Filter by similarity threshold
+        if (similarity >= threshold) {
+          similarArticles.push({
+            id: doc.value.article_id,
+            title: doc.value.title,
+            description: doc.value.description,
+            content: doc.value.content,
+            summary: doc.value.summary,
+            sentiment: doc.value.sentiment,
+            source: doc.value.source,
+            publishedAt: doc.value.publishedAt,
+            category: doc.value.category,
+            urlToImage: doc.value.urlToImage,
+            url: doc.value.url,
+            similarity: similarity,
+            distance: score
+          });
+        }
+      }
+    }
+
+    // Sort by similarity (highest first) and limit results
+    const finalResults = similarArticles
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, limit);
+
+    console.log(`Found ${finalResults.length} similar articles above threshold ${threshold}`);
+    return finalResults;
+
+  } catch (error) {
+    console.error('Error in vector search:', error);
+    throw error;
+  }
+}
+
+async function storeUserPreferences(userId, preferences) {
+  const key = `user:${userId}:preferences`;
+  await redis.json.set(key, '$', {
+    userId,
+    preferences,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+// Get user preferences
+async function getUserPreferences(userId) {
+  const key = `user:${userId}:preferences`;
+  const prefs = await redis.json.get(key);
+  return prefs;
+}
+
+// Update user preferences
+async function updateUserPreferences(userId, preferences) {
+  const key = `user:${userId}:preferences`;
+  const exists = await redis.exists(key);
+  
+  if (exists) {
+    await redis.json.set(key, '$.preferences', preferences);
+    await redis.json.set(key, '$.updatedAt', new Date().toISOString());
+  } else {
+    await storeUserPreferences(userId, preferences);
+  }
+}
+
+// Get personalized news based on user preferences using vector search
+async function getPersonalizedNews(userId, limit = 10, offset = 0) {
+  try {
+    const userPrefs = await getUserPreferences(userId);
+    
+    if (!userPrefs || !userPrefs.preferences || userPrefs.preferences.length === 0) {
+      // Fallback to general articles if no preferences
+      return getAllArticles(limit, offset);
+    }
+
+    const { preferences } = userPrefs;
+    
+    // Use vector search for each preference and combine results
+    const allVectorResults = [];
+    
+    for (const preference of preferences) {
+      try {
+        // Use vector search for each preference with lower threshold for more results
+        const vectorResults = await vectorSearchSimilarNews(preference, limit * 2, 0.3, {});
+        
+        // Add preference info to each result
+        const resultsWithPreference = vectorResults.map(article => ({
+          ...article,
+          personalized: true,
+          matched_preference: preference,
+          similarity_score: article.similarity
+        }));
+        
+        allVectorResults.push(...resultsWithPreference);
+      } catch (vectorError) {
+        console.error(`Vector search failed for preference "${preference}":`, vectorError);
+        // Fallback to text search for this preference
+        const textResults = await searchArticlesByTopic(preference, limit, 0);
+        const textResultsWithPreference = textResults.articles.map(article => ({
+          ...article,
+          personalized: true,
+          matched_preference: preference,
+          search_method: 'text'
+        }));
+        allVectorResults.push(...textResultsWithPreference);
+      }
+    }
+    
+    // Remove duplicates and rank by similarity
+    const uniqueArticles = new Map();
+    
+    for (const article of allVectorResults) {
+      if (!uniqueArticles.has(article.id)) {
+        uniqueArticles.set(article.id, article);
+      } else {
+        // If article already exists, keep the one with higher similarity
+        const existing = uniqueArticles.get(article.id);
+        if (article.similarity_score > existing.similarity_score) {
+          uniqueArticles.set(article.id, article);
+        }
+      }
+    }
+    
+    // Sort by similarity score (highest first) and apply pagination
+    const sortedArticles = Array.from(uniqueArticles.values())
+      .sort((a, b) => (b.similarity_score || 0) - (a.similarity_score || 0))
+      .slice(offset, offset + limit);
+    
+    // If we don't have enough personalized results, mix with general articles
+    if (sortedArticles.length < limit) {
+      const remainingLimit = limit - sortedArticles.length;
+      const existingIds = new Set(sortedArticles.map(a => a.id));
+      
+      const generalResult = await getAllArticles(remainingLimit * 2, 0);
+      const generalArticles = generalResult.articles
+        .filter(article => !existingIds.has(article.id))
+        .slice(0, remainingLimit)
+        .map(article => ({ 
+          ...article, 
+          personalized: false,
+          search_method: 'general'
+        }));
+      
+      sortedArticles.push(...generalArticles);
+    }
+    
+    return {
+      articles: sortedArticles.slice(0, limit),
+      totalCount: uniqueArticles.size
+    };
+  } catch (error) {
+    console.error('Error getting personalized news:', error);
+    // Fallback to regular articles
+    return getAllArticles(limit, offset);
   }
 }
 
@@ -107,6 +369,8 @@ async function searchArticlesByTopic(topic, limit = 10, offset = 0) {
   }
 }
 
+
+
 // Search articles by sentiment (with pagination)
 async function searchArticlesBySentiment(sentiment, limit = 10, offset = 0) {
   try {
@@ -140,7 +404,6 @@ async function searchArticlesBySentiment(sentiment, limit = 10, offset = 0) {
     return { articles: [], totalCount: 0 };
   }
 }
-
 // Enhanced similarity search using Redis 8 features (with pagination)
 async function findSimilarArticles(articleId, limit = 6, offset = 0) {
   try {
@@ -153,23 +416,60 @@ async function findSimilarArticles(articleId, limit = 6, offset = 0) {
       return { articles: [], totalCount: 0 };
     }
 
-    // Use multiple Redis 8 enhanced similarity strategies
-    const strategies = await Promise.allSettled([
-      advancedTextSimilarity(targetArticle, limit + offset + 10), // Get more for better ranking
-      semanticSimilarity(targetArticle, limit + offset + 10),
-      categoryBasedSimilarity(targetArticle, limit + offset + 10),
-      temporalSimilarity(targetArticle, limit + offset + 10)
-    ]);
+    // Use keywords already stored in the article
+    const keywords = targetArticle.keywords || [];
+    let searchText;
+    
+    if (keywords.length === 0) {
+      console.log('No keywords found in article, using title as fallback');
+      // Fallback to using title if no keywords are stored
+      searchText = targetArticle.title;
+      console.log(`Searching with title: ${searchText}`);
+    } else {
+      // Create search text from stored keywords
+      searchText = keywords.join(' ');
+      console.log(`Searching with stored keywords: ${searchText}`);
+    }
+    
+    // Use vector search as primary method with 0.5 threshold
+    try {
+      const vectorResults = await vectorSearchSimilarNews(searchText, limit + offset + 10, 0.5, {}, articleId);
+      
+      // Convert results and apply pagination
+      const filteredResults = vectorResults
+        .slice(offset, offset + limit)
+        .map(article => ({
+          ...article,
+          similarity_score: article.similarity,
+          search_method: 'vector',
+          keywords_used: keywords.length > 0 ? keywords : [targetArticle.title]
+        }));
 
-    // Combine and rank results using Redis ZUNIONSTORE for score aggregation
-    const combinedResults = await combineAndRankSimilarity(
-      strategies.filter(s => s.status === 'fulfilled').map(s => s.value),
-      targetArticle.id,
-      limit,
-      offset
-    );
+      return {
+        articles: filteredResults,
+        totalCount: vectorResults.length
+      };
+    } catch (vectorError) {
+      console.error('Vector search failed, falling back to text-based similarity:', vectorError);
+      
+      // Fallback to original text-based similarity methods
+      const strategies = await Promise.allSettled([
+        advancedTextSimilarity(targetArticle, limit + offset + 10),
+        semanticSimilarity(targetArticle, limit + offset + 10),
+        categoryBasedSimilarity(targetArticle, limit + offset + 10),
+        temporalSimilarity(targetArticle, limit + offset + 10)
+      ]);
 
-    return combinedResults;
+      // Combine and rank results using Redis ZUNIONSTORE for score aggregation
+      const combinedResults = await combineAndRankSimilarity(
+        strategies.filter(s => s.status === 'fulfilled').map(s => s.value),
+        targetArticle.id,
+        limit,
+        offset
+      );
+
+      return combinedResults;
+    }
   } catch (error) {
     console.error('Error finding similar articles:', error);
     return await fallbackSimilarSearch(articleId, limit, offset);
@@ -610,13 +910,19 @@ async function getAllArticles(limit = 10, offset = 0) {
   }
 }
 
-module.exports = { 
-  redis, 
-  storeArticle, 
-  articleExists, 
-  createSearchIndex,
+module.exports = {
+  redis,
   searchArticlesByTopic,
   searchArticlesBySentiment,
+  getAllArticles,
+  createSearchIndex,
   findSimilarArticles,
-  getAllArticles
+  storeArticle,
+  articleExists,
+  // Add these new exports
+  storeUserPreferences,
+  getUserPreferences,
+  updateUserPreferences,
+  getPersonalizedNews,
+  vectorSearchSimilarNews
 };

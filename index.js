@@ -1,26 +1,38 @@
 require('dotenv').config();
 const cron = require('node-cron');
 const { fetchNews } = require('./newsFetcher');
-const { summarizeAndAnalyze } = require('./geminiClient');
+const { summarizeAndAnalyze, generateEmbedding } = require('./geminiClient');
 const { storeArticle, articleExists } = require('./redisClient');
 const crypto = require('crypto');
 const axios = require('axios');
 
-async function generateEmbedding(text) {
+async function generateEmbedding1(text) {
   try {
     const url = 'https://generativelanguage.googleapis.com/v1beta/models/embedding-001:embedContent?key=' + process.env.GEMINI_API_KEY;
     const body = {
       content: { parts: [{ text }] }
     };
     const response = await axios.post(url, body);
-    // The vector is in response.data.embedding.values
-    return response.data.embedding.values;
+    
+    // Debug logging
+    console.log('API Response structure:', JSON.stringify(response.data, null, 2));
+    console.log('Embedding path exists:', !!response.data.embedding?.values);
+    console.log('Raw embedding length:', response.data.embedding?.values?.length);
+    
+    const embedding = response.data.embedding.values;
+    
+    // Additional validation
+    if (!Array.isArray(embedding)) {
+      console.error('Expected array, got:', typeof embedding);
+      return [];
+    }
+    
+    return embedding;
   } catch (e) {
     console.error('Error generating embedding:', e?.response?.data || e);
     return [];
   }
 }
-
 async function processNews() {
   console.log('Fetching news for multiple topics...');
   
@@ -59,7 +71,7 @@ async function processNews() {
       console.log(`Skipping duplicate: ${article.title}`);
       continue;
     }
-    const { summary, sentiment } = await summarizeAndAnalyze(article.title, article.content || article.description || '');
+    const { summary, sentiment, keywords } = await summarizeAndAnalyze(article.title, article.content || article.description || '');
     // Generate embedding vector for title + content
     const embeddingText = `${article.title} ${article.content || article.description || ''}`;
     const vector = await generateEmbedding(embeddingText);
@@ -69,6 +81,7 @@ async function processNews() {
       content: article.content,
       summary,
       sentiment,
+      keywords,
       source: article.source, // Save full source object
       publishedAt: article.publishedAt,
       url: article.url,

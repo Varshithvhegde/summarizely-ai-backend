@@ -7,8 +7,15 @@ const {
   searchArticlesBySentiment, 
   getAllArticles,
   createSearchIndex,
-  findSimilarArticles
+  findSimilarArticles,
+  // Add these new imports
+  storeUserPreferences,
+  getUserPreferences,
+  updateUserPreferences,
+  getPersonalizedNews,
+  vectorSearchSimilarNews
 } = require('./redisClient');
+
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -281,6 +288,8 @@ async function handleSearchWithTopic(req, res, filters, pagination) {
   }
 }
 
+
+
 // Get a single article by ID
 app.get('/api/news/:id', async (req, res) => {
   try {
@@ -349,6 +358,7 @@ app.get('/api/topics', async (req, res) => {
   const topics = [
     'India',
     'Technology', 
+    'Politics',
     'World',
     'Sports',
     'Business',
@@ -407,6 +417,201 @@ app.get('/api/sources', async (req, res) => {
         hasPrev: false
       }
     });
+  }
+});
+
+// Generate unique user ID endpoint
+app.post('/api/user/generate-id', (req, res) => {
+  try {
+    const userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    res.json({ userId });
+  } catch (error) {
+    console.error('Error generating user ID:', error);
+    res.status(500).json({ error: 'Failed to generate user ID' });
+  }
+});
+
+// Store user preferences
+app.post('/api/user/:userId/preferences', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    // req.body is returning { topics: [ 'india' ] }
+    const preferences = req.body.topics;
+    if (!preferences || !Array.isArray(preferences)) {
+      console.log(req.body);
+      return res.status(400).json({ error: 'Preferences must be an array' });
+    }
+    
+    // Validate and clean preferences
+    const cleanPreferences = preferences
+      .filter(pref => typeof pref === 'string' && pref.trim().length > 0)
+      .map(pref => pref.trim().toLowerCase())
+      .slice(0, 10); // Limit to 10 preferences
+    
+    if (cleanPreferences.length === 0) {
+      return res.status(400).json({ error: 'At least one valid preference is required' });
+    }
+    
+    await storeUserPreferences(userId, cleanPreferences);
+    res.json({ 
+      message: 'Preferences stored successfully',
+      preferences: cleanPreferences
+    });
+  } catch (error) {
+    console.error('Error storing user preferences:', error);
+    res.status(500).json({ error: 'Failed to store preferences' });
+  }
+});
+
+// Get user preferences
+app.get('/api/user/:userId/preferences', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const userPrefs = await getUserPreferences(userId);
+    
+    if (!userPrefs) {
+      return res.status(404).json({ error: 'User preferences not found' });
+    }
+    
+    res.json(userPrefs);
+  } catch (error) {
+    console.error('Error fetching user preferences:', error);
+    res.status(500).json({ error: 'Failed to fetch preferences' });
+  }
+});
+
+// Update user preferences
+app.put('/api/user/:userId/preferences', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const preferences = req.body.topics;
+    console.log(preferences);
+    if (!preferences || !Array.isArray(preferences)) {
+
+      return res.status(400).json({ error: 'Preferences must be an array' });
+    }
+    
+    const cleanPreferences = preferences
+      .filter(pref => typeof pref === 'string' && pref.trim().length > 0)
+      .map(pref => pref.trim().toLowerCase())
+      .slice(0, 10);
+    
+    if (cleanPreferences.length === 0) {
+      return res.status(400).json({ error: 'At least one valid preference is required' });
+    }
+    
+    await updateUserPreferences(userId, cleanPreferences);
+    res.json({ 
+      message: 'Preferences updated successfully',
+      preferences: cleanPreferences
+    });
+  } catch (error) {
+    console.error('Error updating user preferences:', error);
+    res.status(500).json({ error: 'Failed to update preferences' });
+  }
+});
+
+// Get personalized news feed
+app.get('/api/user/:userId/personalized-news', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { page, limit, offset } = getPaginationParams(req);
+    
+    const result = await getPersonalizedNews(userId, limit, offset);
+    const response = createPaginatedResponse(
+      result.articles,
+      result.totalCount,
+      page,
+      limit,
+      req
+    );
+    
+    res.json(response);
+  } catch (error) {
+    console.error('Error fetching personalized news:', error);
+    res.status(500).json({ error: 'Failed to fetch personalized news' });
+  }
+});
+
+// Get personalized news with additional filters
+app.get('/api/user/:userId/personalized-news/search', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { q, sentiment, source } = req.query;
+    const { page, limit, offset } = getPaginationParams(req);
+    
+    // Get user preferences first
+    const userPrefs = await getUserPreferences(userId);
+    
+    if (!userPrefs || !userPrefs.preferences || userPrefs.preferences.length === 0) {
+      // Fallback to regular search if no preferences
+      return res.redirect(`/api/news/search?${new URLSearchParams(req.query).toString()}`);
+    }
+    
+    // Build query combining user preferences with additional filters
+    const preferenceQueries = userPrefs.preferences.map(pref => {
+      const cleanPref = pref.replace(/[^\w\s]/g, ' ').trim();
+      return [
+        `@title:(${cleanPref})`,
+        `@description:(${cleanPref})`,
+        `@content:(${cleanPref})`,
+        `@summary:(${cleanPref})`
+      ].join(' | ');
+    });
+    
+    let queryParts = [`(${preferenceQueries.map(q => `(${q})`).join(' | ')})`];
+    
+    // Add additional filters
+    if (q) {
+      const searchQuery = [
+        `@title:(${q})`,
+        `@description:(${q})`,
+        `@content:(${q})`,
+        `@summary:(${q})`
+      ].join(' | ');
+      queryParts.push(`(${searchQuery})`);
+    }
+    
+    if (sentiment) {
+      queryParts.push(`@sentiment:{${sentiment}}`);
+    }
+    
+    if (source) {
+      queryParts.push(`@source:{${source}}`);
+    }
+    
+    const finalQuery = queryParts.join(' ');
+    
+    // Get total count
+    const countResults = await redis.ft.search(
+      'idx:news',
+      finalQuery,
+      { LIMIT: { from: 0, size: 0 } }
+    );
+    
+    const totalCount = countResults.total || 0;
+    
+    // Get paginated results
+    const results = await redis.ft.search(
+      'idx:news',
+      finalQuery,
+      { 
+        SORTBY: { BY: 'publishedAt', DIRECTION: 'DESC' }, 
+        LIMIT: { from: offset, size: limit }
+      }
+    );
+    
+    const articles = results.documents.map(doc => ({
+      ...doc.value,
+      personalized: true
+    }));
+    
+    const response = createPaginatedResponse(articles, totalCount, page, limit, req);
+    res.json(response);
+  } catch (error) {
+    console.error('Error fetching personalized search results:', error);
+    res.status(500).json({ error: 'Failed to fetch personalized search results' });
   }
 });
 
