@@ -8,6 +8,8 @@ const {
   getAllArticles,
   createSearchIndex,
   findSimilarArticles,
+  getSimilarArticleCacheStats,
+  clearSimilarArticleCache,
   // Add these new imports
   storeUserPreferences,
   getUserPreferences,
@@ -614,6 +616,28 @@ app.get('/api/user/:userId/personalized-news/search', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch personalized search results' });
   }
 });
+
+app.get('/api/getSimiliarStats/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const stats = await getSimilarArticleCacheStats(id);
+    res.json(stats);
+  } catch (error) {
+    console.error('Error fetching similar article cache stats:', error);
+    res.status(500).json({ error: 'Failed to fetch similar article cache stats' });
+  }
+})
+
+app.get('/api/clearSimilarArticleCache/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await clearSimilarArticleCache(id);
+    res.json({ message: 'Similar article cache cleared' });
+  } catch (error) {
+    console.error('Error clearing similar article cache:', error);
+    res.status(500).json({ error: 'Failed to clear similar article cache' });
+  }
+})
 
 // Health check
 app.get('/api/health', (req, res) => {

@@ -404,75 +404,430 @@ async function searchArticlesBySentiment(sentiment, limit = 10, offset = 0) {
     return { articles: [], totalCount: 0 };
   }
 }
-// Enhanced similarity search using Redis 8 features (with pagination)
-async function findSimilarArticles(articleId, limit = 6, offset = 0) {
+
+// Enhanced similarity search using Redis 8 features with advanced caching
+async function findSimilarArticles(articleId, limit = 6, offset = 0, options = {}) {
   try {
-    // Get the target article
-    const key = `news:${articleId}`;
-    const targetArticle = await redis.json.get(key);
+    const {
+      forceRefresh = false,
+      cacheTimeout = 3600, // 1 hour default
+      includeCacheStats = false,
+      useBloomFilter = true,
+      enablePipeline = true
+    } = options;
+
+    // Generate cache key with parameters for better granularity
+    const cacheKey = `similar:${articleId}:${limit}:${offset}`;
+    const metaCacheKey = `similar_meta:${articleId}`;
+    const bloomKey = `similar_bloom:${articleId}`;
+    const statsKey = `similar_stats:${articleId}`;
+
+    // Check if article exists using Redis 8's improved EXISTS with pipeline
+    let pipeline = enablePipeline ? redis.multi() : null;
+    
+    if (!forceRefresh) {
+      if (enablePipeline) {
+        // Use pipeline for batch cache check
+        pipeline.json.get(cacheKey);
+        pipeline.json.get(metaCacheKey);
+        
+        try {
+          const results = await pipeline.exec();
+          
+          // Safely extract results, handling null/error cases
+          const cachedResults = results && results[0] && results[0][0] === null ? results[0][1] : null;
+          const metaData = results && results[1] && results[1][0] === null ? results[1][1] : null;
+          
+          if (cachedResults && metaData && cachedResults.results) {
+            // Update cache hit statistics
+            await redis.hIncrBy(statsKey, 'cache_hits', 1);
+            await redis.hIncrBy(statsKey, 'total_requests', 1);
+            await redis.expire(statsKey, cacheTimeout);
+
+            console.log(`Cache HIT for similar articles: ${articleId}`);
+            
+            const response = {
+              articles: cachedResults.results.slice(offset, offset + limit),
+              totalCount: metaData.totalCount,
+              cached: true,
+              cacheAge: Date.now() - metaData.timestamp
+            };
+
+            if (includeCacheStats) {
+              const stats = await redis.hGetAll(statsKey);
+              response.cacheStats = {
+                hits: parseInt(stats.cache_hits || 0),
+                misses: parseInt(stats.cache_misses || 0),
+                hitRate: stats.cache_hits ? (parseInt(stats.cache_hits) / parseInt(stats.total_requests || 1)) * 100 : 0
+              };
+            }
+
+            return response;
+          }
+        } catch (pipelineError) {
+          console.log('Pipeline cache check failed, falling back to individual calls:', pipelineError);
+          // Fall through to non-pipeline approach
+        }
+      }
+      
+      // Non-pipeline approach or fallback
+      try {
+        const [cachedResults, metaData] = await Promise.all([
+          redis.json.get(cacheKey).catch(() => null),
+          redis.json.get(metaCacheKey).catch(() => null)
+        ]);
+        
+        if (cachedResults && metaData && cachedResults.results) {
+          await redis.hIncrBy(statsKey, 'cache_hits', 1);
+          await redis.hIncrBy(statsKey, 'total_requests', 1);
+          await redis.expire(statsKey, cacheTimeout);
+          
+          console.log(`Cache HIT for similar articles: ${articleId}`);
+          
+          const response = {
+            articles: cachedResults.results.slice(offset, offset + limit),
+            totalCount: metaData.totalCount,
+            cached: true,
+            cacheAge: Date.now() - metaData.timestamp
+          };
+
+          if (includeCacheStats) {
+            const stats = await redis.hGetAll(statsKey);
+            response.cacheStats = {
+              hits: parseInt(stats.cache_hits || 0),
+              misses: parseInt(stats.cache_misses || 0),
+              hitRate: stats.total_requests ? (parseInt(stats.cache_hits || 0) / parseInt(stats.total_requests)) * 100 : 0
+            };
+          }
+
+          return response;
+        }
+      } catch (cacheError) {
+        console.log('Cache check failed:', cacheError);
+        // Continue to cache miss logic
+      }
+    }
+
+    // Cache miss - update statistics
+    await redis.hIncrBy(statsKey, 'cache_misses', 1);
+    await redis.hIncrBy(statsKey, 'total_requests', 1);
+    await redis.expire(statsKey, cacheTimeout);
+
+    console.log(`Cache MISS for similar articles: ${articleId}`);
+
+    // Get the target article using Redis 8's improved JSON operations
+    const articleKey = `news:${articleId}`;
+    const targetArticle = await redis.json.get(articleKey);
     
     if (!targetArticle) {
       console.log('Article not found:', articleId);
-      return { articles: [], totalCount: 0 };
+      return { articles: [], totalCount: 0, cached: false };
     }
 
-    // Use keywords already stored in the article
+    // Use Redis 8's Bloom Filter for efficient duplicate checking (if enabled)
+    if (useBloomFilter) {
+      try {
+        // Create bloom filter if it doesn't exist
+        await redis.bf.reserve(bloomKey, 0.01, 1000).catch(() => {
+          // Bloom filter might already exist
+        });
+        console.log('Bloom filter created');
+        
+        // Check if we've processed this article recently
+        const recentlyProcessed = await redis.bf.exists(bloomKey, articleId);
+        console.log('Recently processed:', recentlyProcessed);
+        if (recentlyProcessed && !forceRefresh) {
+          console.log('Article recently processed, using cached computation');
+        }
+        
+        // Add to bloom filter
+        await redis.bf.add(bloomKey, articleId);
+        await redis.expire(bloomKey, cacheTimeout);
+      } catch (bloomError) {
+        console.log('Bloom filter not available, continuing without it');
+      }
+    }
+
+    // Determine search strategy
     const keywords = targetArticle.keywords || [];
     let searchText;
+    let searchMethod = 'vector';
     
     if (keywords.length === 0) {
       console.log('No keywords found in article, using title as fallback');
-      // Fallback to using title if no keywords are stored
       searchText = targetArticle.title;
-      console.log(`Searching with title: ${searchText}`);
     } else {
-      // Create search text from stored keywords
       searchText = keywords.join(' ');
       console.log(`Searching with stored keywords: ${searchText}`);
     }
     
-    // Use vector search as primary method with 0.5 threshold
-    try {
-      const vectorResults = await vectorSearchSimilarNews(searchText, limit + offset + 10, 0.5, {}, articleId);
-      
-      // Convert results and apply pagination
-      const filteredResults = vectorResults
-        .slice(offset, offset + limit)
-        .map(article => ({
-          ...article,
-          similarity_score: article.similarity,
-          search_method: 'vector',
-          keywords_used: keywords.length > 0 ? keywords : [targetArticle.title]
-        }));
+    let similarArticles = [];
+    let totalCount = 0;
 
-      return {
-        articles: filteredResults,
-        totalCount: vectorResults.length
-      };
+    // Primary: Vector search with Redis 8's enhanced vector operations
+    try {
+      const vectorResults = await vectorSearchSimilarNews(
+        searchText, 
+        limit + offset + 20, // Get more for better caching
+        0.5, 
+        {}, 
+        articleId
+      );
+      
+      similarArticles = vectorResults.map(article => ({
+        ...article,
+        similarity_score: article.similarity,
+        search_method: 'vector',
+        keywords_used: keywords.length > 0 ? keywords : [targetArticle.title]
+      }));
+      
+      totalCount = vectorResults.length;
+      
     } catch (vectorError) {
       console.error('Vector search failed, falling back to text-based similarity:', vectorError);
+      searchMethod = 'text';
       
-      // Fallback to original text-based similarity methods
+      // Fallback to text-based methods
       const strategies = await Promise.allSettled([
-        advancedTextSimilarity(targetArticle, limit + offset + 10),
-        semanticSimilarity(targetArticle, limit + offset + 10),
-        categoryBasedSimilarity(targetArticle, limit + offset + 10),
-        temporalSimilarity(targetArticle, limit + offset + 10)
+        advancedTextSimilarity(targetArticle, limit + offset + 20),
+        semanticSimilarity(targetArticle, limit + offset + 20),
+        categoryBasedSimilarity(targetArticle, limit + offset + 20),
+        temporalSimilarity(targetArticle, limit + offset + 20)
       ]);
 
-      // Combine and rank results using Redis ZUNIONSTORE for score aggregation
       const combinedResults = await combineAndRankSimilarity(
         strategies.filter(s => s.status === 'fulfilled').map(s => s.value),
         targetArticle.id,
-        limit,
-        offset
+        limit + offset + 20,
+        0
       );
 
-      return combinedResults;
+      similarArticles = combinedResults.articles || [];
+      totalCount = combinedResults.totalCount || 0;
+    }
+
+    // Cache the results using Redis 8's improved caching with multiple strategies
+    const cacheData = {
+      results: similarArticles,
+      timestamp: Date.now(),
+      searchMethod: searchMethod,
+      articleId: articleId,
+      version: '1.0'
+    };
+
+    const metaData = {
+      totalCount: totalCount,
+      timestamp: Date.now(),
+      searchMethod: searchMethod,
+      lastUpdated: new Date().toISOString()
+    };
+
+    // Use Redis 8's pipeline for efficient bulk operations
+    const cachePipeline = redis.multi();
+    
+    // Store main cache data with compression hint
+    cachePipeline.json.set(cacheKey, '$', cacheData);
+    cachePipeline.expire(cacheKey, cacheTimeout);
+    
+    // Store metadata separately for quick access
+    cachePipeline.json.set(metaCacheKey, '$', metaData);
+    cachePipeline.expire(metaCacheKey, cacheTimeout);
+    
+    // Use Redis 8's sorted sets for LRU-style cache management
+    const cacheManagementKey = `similar_cache_lru`;
+    cachePipeline.zAdd(cacheManagementKey, {
+      score: Date.now(),
+      value: cacheKey
+    });
+    
+    // Keep only the most recent 1000 cached similar article sets
+    cachePipeline.zRemRangeByRank(cacheManagementKey, 0, -1001);
+    cachePipeline.expire(cacheManagementKey, cacheTimeout * 24); // Keep management key longer
+    
+    // Execute all cache operations
+    await cachePipeline.exec();
+
+    // Use Redis 8's HyperLogLog for unique visitor tracking
+    try {
+      await redis.pfAdd(`similar_unique_articles:${new Date().toISOString().split('T')[0]}`, articleId);
+    } catch (hllError) {
+      console.log('HyperLogLog tracking failed:', hllError);
+    }
+
+    console.log(`Cached similar articles for: ${articleId} (${similarArticles.length} articles)`);
+
+    // Prepare response
+    const response = {
+      articles: similarArticles.slice(offset, offset + limit),
+      totalCount: totalCount,
+      cached: false,
+      searchMethod: searchMethod,
+      processingTime: Date.now() - cacheData.timestamp
+    };
+
+    if (includeCacheStats) {
+      const stats = await redis.hGetAll(statsKey);
+      response.cacheStats = {
+        hits: parseInt(stats.cache_hits || 0),
+        misses: parseInt(stats.cache_misses || 0),
+        hitRate: stats.total_requests ? (parseInt(stats.cache_hits || 0) / parseInt(stats.total_requests)) * 100 : 0
+      };
+    }
+
+    return response;
+
+  } catch (error) {
+    console.error('Error in cached findSimilarArticles:', error);
+    
+    // Error fallback - try to return any available cached data
+    try {
+      const fallbackKey = `similar:${articleId}:fallback`;
+      const fallbackData = await redis.json.get(fallbackKey);
+      if (fallbackData) {
+        console.log('Returning fallback cached data due to error');
+        return {
+          articles: fallbackData.results.slice(offset, offset + limit),
+          totalCount: fallbackData.totalCount || 0,
+          cached: true,
+          fallback: true,
+          error: error.message
+        };
+      }
+    } catch (fallbackError) {
+      console.error('Fallback cache also failed:', fallbackError);
+    }
+    
+    // Final fallback - return basic article info
+    return {
+      articles: [],
+      totalCount: 0,
+      cached: false,
+      error: error.message,
+      fallback: true
+    };
+  }
+}
+
+// Utility function to get cache statistics and health
+async function getSimilarArticleCacheStats(articleId = null) {
+  try {
+    const stats = {};
+    
+    if (articleId) {
+      // Get stats for specific article
+      const statsKey = `similar_stats:${articleId}`;
+      const articleStats = await redis.hGetAll(statsKey);
+      stats.article = {
+        id: articleId,
+        hits: parseInt(articleStats.cache_hits || 0),
+        misses: parseInt(articleStats.cache_misses || 0),
+        totalRequests: parseInt(articleStats.total_requests || 0),
+        hitRate: articleStats.total_requests ? 
+          (parseInt(articleStats.cache_hits || 0) / parseInt(articleStats.total_requests)) * 100 : 0
+      };
+    }
+    
+    // Get overall cache management stats
+    const lruKey = 'similar_cache_lru';
+    const totalCached = await redis.zCard(lruKey);
+    const oldestCache = await redis.zRange(lruKey, 0, 0, { WITHSCORES: true });
+    const newestCache = await redis.zRange(lruKey, -1, -1, { WITHSCORES: true });
+    
+    stats.overall = {
+      totalCachedArticles: totalCached,
+      oldestCacheTime: oldestCache.length > 0 ? new Date(oldestCache[0].score) : null,
+      newestCacheTime: newestCache.length > 0 ? new Date(newestCache[0].score) : null
+    };
+    
+    // Get daily unique articles processed using HyperLogLog
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const uniqueToday = await redis.pfCount(`similar_unique_articles:${today}`);
+      stats.daily = {
+        date: today,
+        uniqueArticlesProcessed: uniqueToday
+      };
+    } catch (hllError) {
+      stats.daily = { error: 'HyperLogLog not available' };
+    }
+    
+    return stats;
+  } catch (error) {
+    console.error('Error getting cache stats:', error);
+    return { error: error.message };
+  }
+}
+
+// Function to clear cache for specific article or all similar article caches
+async function clearSimilarArticleCache(articleId = null, options = {}) {
+  try {
+    const { clearStats = false, clearBloom = false } = options;
+    
+    if (articleId) {
+      // Clear cache for specific article
+      const pattern = `similar:${articleId}:*`;
+      const keys = await redis.keys(pattern);
+      
+      if (keys.length > 0) {
+        await redis.del(keys);
+      }
+      
+      // Clear metadata
+      await redis.del(`similar_meta:${articleId}`);
+      
+      if (clearStats) {
+        await redis.del(`similar_stats:${articleId}`);
+      }
+      
+      if (clearBloom) {
+        await redis.del(`similar_bloom:${articleId}`);
+      }
+      
+      // Remove from LRU management
+      const lruKey = 'similar_cache_lru';
+      const lruKeys = await redis.zRange(lruKey, 0, -1);
+      const keysToRemove = lruKeys.filter(key => key.includes(articleId));
+      if (keysToRemove.length > 0) {
+        await redis.zRem(lruKey, keysToRemove);
+      }
+      
+      console.log(`Cleared cache for article: ${articleId}`);
+      return { cleared: keys.length + 1, articleId };
+    } else {
+      // Clear all similar article caches
+      const patterns = ['similar:*', 'similar_meta:*', 'similar_cache_lru'];
+      let totalCleared = 0;
+      
+      for (const pattern of patterns) {
+        const keys = await redis.keys(pattern);
+        if (keys.length > 0) {
+          await redis.del(keys);
+          totalCleared += keys.length;
+        }
+      }
+      
+      if (clearStats) {
+        const statsKeys = await redis.keys('similar_stats:*');
+        if (statsKeys.length > 0) {
+          await redis.del(statsKeys);
+          totalCleared += statsKeys.length;
+        }
+      }
+      
+      if (clearBloom) {
+        const bloomKeys = await redis.keys('similar_bloom:*');
+        if (bloomKeys.length > 0) {
+          await redis.del(bloomKeys);
+          totalCleared += bloomKeys.length;
+        }
+      }
+      
+      console.log(`Cleared all similar article caches: ${totalCleared} keys`);
+      return { cleared: totalCleared, scope: 'all' };
     }
   } catch (error) {
-    console.error('Error finding similar articles:', error);
-    return await fallbackSimilarSearch(articleId, limit, offset);
+    console.error('Error clearing cache:', error);
+    return { error: error.message };
   }
 }
 
@@ -917,6 +1272,8 @@ module.exports = {
   getAllArticles,
   createSearchIndex,
   findSimilarArticles,
+  getSimilarArticleCacheStats,
+  clearSimilarArticleCache,
   storeArticle,
   articleExists,
   // Add these new exports
