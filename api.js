@@ -15,7 +15,10 @@ const {
   getUserPreferences,
   updateUserPreferences,
   getPersonalizedNews,
-  vectorSearchSimilarNews
+  clearPersonalizedCache,
+  getPersonalizedNewsSearch,
+  getAllSources,
+  markArticleAsRead
 } = require('./redisClient');
 
 
@@ -296,13 +299,27 @@ async function handleSearchWithTopic(req, res, filters, pagination) {
 app.get('/api/news/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const userId = req.headers['x-user-id'] || req.query.userId; // Get userId from header or query
+    console.log(userId);
     const key = `news:${id}`;
     const article = await redis.json.get(key);
-    
+
     if (!article) {
       return res.status(404).json({ error: 'Article not found' });
     }
-    
+
+    // Mark article as read if userId is provided
+    if (userId) {
+      // Fire and forget these background tasks
+      Promise.all([
+        markArticleAsRead(userId, id),
+        clearPersonalizedCache(userId),
+        getPersonalizedNews(userId)
+      ]).catch(err => {
+        console.error('Background tasks failed:', err);
+      });
+    }
+
     res.json(article);
   } catch (error) {
     console.error('Error fetching article:', error);
@@ -380,32 +397,8 @@ app.get('/api/sentiments', async (req, res) => {
 // Get available sources (with pagination)
 app.get('/api/sources', async (req, res) => {
   try {
-    const { page, limit, offset } = getPaginationParams(req);
-    
-    const results = await redis.ft.aggregate(
-      'idx:news',
-      '*',
-      {
-        GROUPBY: { REDUCE: 'COUNT', BY: '@source' },
-        SORTBY: { BY: '@__key', DIRECTION: 'DESC' },
-        LIMIT: { from: offset, size: limit }
-      }
-    );
-    
-    // Get total count of sources
-    const totalResults = await redis.ft.aggregate(
-      'idx:news',
-      '*',
-      {
-        GROUPBY: { REDUCE: 'COUNT', BY: '@source' }
-      }
-    );
-    
-    const sources = results.results.map(result => result.source);
-    const totalCount = totalResults.results.length;
-    
-    const response = createPaginatedResponse(sources, totalCount, page, limit, req);
-    res.json(response);
+    const sources = await getAllSources();
+    res.json(sources);
   } catch (error) {
     console.error('Error fetching sources:', error);
     res.json({
@@ -537,85 +530,36 @@ app.get('/api/user/:userId/personalized-news', async (req, res) => {
 });
 
 // Get personalized news with additional filters
+// Get personalized news with additional filters
 app.get('/api/user/:userId/personalized-news/search', async (req, res) => {
   try {
     const { userId } = req.params;
     const { q, sentiment, source } = req.query;
     const { page, limit, offset } = getPaginationParams(req);
     
-    // Get user preferences first
-    const userPrefs = await getUserPreferences(userId);
+    const result = await getPersonalizedNewsSearch(userId, limit, offset, q, sentiment, source);
     
-    if (!userPrefs || !userPrefs.preferences || userPrefs.preferences.length === 0) {
-      // Fallback to regular search if no preferences
-      return res.redirect(`/api/news/search?${new URLSearchParams(req.query).toString()}`);
-    }
-    
-    // Build query combining user preferences with additional filters
-    const preferenceQueries = userPrefs.preferences.map(pref => {
-      const cleanPref = pref.replace(/[^\w\s]/g, ' ').trim();
-      return [
-        `@title:(${cleanPref})`,
-        `@description:(${cleanPref})`,
-        `@content:(${cleanPref})`,
-        `@summary:(${cleanPref})`
-      ].join(' | ');
-    });
-    
-    let queryParts = [`(${preferenceQueries.map(q => `(${q})`).join(' | ')})`];
-    
-    // Add additional filters
-    if (q) {
-      const searchQuery = [
-        `@title:(${q})`,
-        `@description:(${q})`,
-        `@content:(${q})`,
-        `@summary:(${q})`
-      ].join(' | ');
-      queryParts.push(`(${searchQuery})`);
-    }
-    
-    if (sentiment) {
-      queryParts.push(`@sentiment:{${sentiment}}`);
-    }
-    
-    if (source) {
-      queryParts.push(`@source:{${source}}`);
-    }
-    
-    const finalQuery = queryParts.join(' ');
-    
-    // Get total count
-    const countResults = await redis.ft.search(
-      'idx:news',
-      finalQuery,
-      { LIMIT: { from: 0, size: 0 } }
+    const response = createPaginatedResponse(
+      result.articles, 
+      result.totalCount, 
+      page, 
+      limit, 
+      req
     );
     
-    const totalCount = countResults.total || 0;
+    // Add search-specific metadata
+    response.personalizedCount = result.personalizedCount;
+    response.searchQuery = result.searchQuery;
+    response.filters = result.filters;
+    response.cached = result.cached;
     
-    // Get paginated results
-    const results = await redis.ft.search(
-      'idx:news',
-      finalQuery,
-      { 
-        SORTBY: { BY: 'publishedAt', DIRECTION: 'DESC' }, 
-        LIMIT: { from: offset, size: limit }
-      }
-    );
-    
-    const articles = results.documents.map(doc => ({
-      ...doc.value,
-      personalized: true
-    }));
-    
-    const response = createPaginatedResponse(articles, totalCount, page, limit, req);
     res.json(response);
   } catch (error) {
     console.error('Error fetching personalized search results:', error);
     res.status(500).json({ error: 'Failed to fetch personalized search results' });
   }
 });
+
 
 app.get('/api/getSimiliarStats/:id', async (req, res) => {
   try {

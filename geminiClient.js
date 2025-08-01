@@ -50,7 +50,7 @@ async function generateEmbedding(text) {
     });
 
     // Gemini returns { embeddings: [ { values: [...] } ] }
-    console.log(response.embeddings[0].values);
+    // console.log(response.embeddings[0].values);
     return response.embeddings[0].values;
   } catch (e) {
     console.error('Error generating embedding:', e);

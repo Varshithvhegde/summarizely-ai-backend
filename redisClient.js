@@ -149,7 +149,7 @@ async function vectorSearchSimilarNews(searchText, limit = 10, threshold = 0.7, 
         DIRECTION: 'ASC' // Lower scores mean higher similarity in cosine distance
       },
       RETURN: [
-        'title', 'description', 'content', 'summary', 'sentiment', 
+        'title', 'description', 'content', 'summary', 'sentiment', 'keywords',
         'source', 'publishedAt', 'category', 'article_id', 'urlToImage', 'url', 'vector_score'
       ],
       LIMIT: {
@@ -158,7 +158,7 @@ async function vectorSearchSimilarNews(searchText, limit = 10, threshold = 0.7, 
       },
       DIALECT: 2
     });
-    console.log(searchResults);
+    // console.log("Search Results", searchResults);
 
     // Process and filter results
     const similarArticles = [];
@@ -167,7 +167,7 @@ async function vectorSearchSimilarNews(searchText, limit = 10, threshold = 0.7, 
       for (const doc of searchResults.documents) {
         const score = parseFloat(doc.value.vector_score || 1);
         const similarity = 1 - score; // Convert distance to similarity (higher is more similar)
-        console.log(similarity);
+        // console.log(similarity);
         // Filter by similarity threshold
         if (similarity >= threshold) {
           similarArticles.push({
@@ -178,6 +178,7 @@ async function vectorSearchSimilarNews(searchText, limit = 10, threshold = 0.7, 
             summary: doc.value.summary,
             sentiment: doc.value.sentiment,
             source: doc.value.source,
+            keywords: doc.value.keywords,
             publishedAt: doc.value.publishedAt,
             category: doc.value.category,
             urlToImage: doc.value.urlToImage,
@@ -195,6 +196,7 @@ async function vectorSearchSimilarNews(searchText, limit = 10, threshold = 0.7, 
       .slice(0, limit);
 
     console.log(`Found ${finalResults.length} similar articles above threshold ${threshold}`);
+    // console.log("Final Results", finalResults);
     return finalResults;
 
   } catch (error) {
@@ -234,94 +236,785 @@ async function updateUserPreferences(userId, preferences) {
 }
 
 // Get personalized news based on user preferences using vector search
-async function getPersonalizedNews(userId, limit = 10, offset = 0) {
+// Enhanced cached personalized news function with Redis 8 features
+// Simplified personalized news function using the excellent vectorSearchSimilarNews
+// Store read article with TTL
+async function markArticleAsRead(userId, articleId) {
+  if (!userId || !articleId) return;
+  
+  const key = `user:${userId}:read:${articleId}`;
+  await redis.setEx(key, 7200, Date.now().toString()); // Convert to string
+  
+  // Also add to a sorted set for easier bulk operations
+  const readSetKey = `user:${userId}:read_set`;
+  await redis.zAdd(readSetKey, { score: Date.now(), value: articleId });
+  await redis.expire(readSetKey, 7200);
+}
+
+// Check if article is read by user
+async function isArticleRead(userId, articleId) {
+  if (!userId || !articleId) return false;
+  
+  const key = `user:${userId}:read:${articleId}`;
+  const exists = await redis.exists(key);
+  return exists === 1;
+}
+
+// Get all read article IDs for a user
+async function getUserReadArticles(userId) {
+  if (!userId) return [];
+  
+  const readSetKey = `user:${userId}:read_set`;
+  const readArticles = await redis.zRange(readSetKey, 0, -1);
+  return readArticles || [];
+}
+
+// Filter out read articles from results
+async function filterReadArticles(userId, articles) {
+  if (!userId || !articles || articles.length === 0) return articles;
+  
+  const readArticleIds = await getUserReadArticles(userId);
+  if (readArticleIds.length === 0) return articles;
+  
+  const readSet = new Set(readArticleIds);
+  return articles.filter(article => !readSet.has(article.id));
+}
+
+// Updated API route
+async function getArticleById(req, res) {
   try {
+    const { id } = req.params;
+    const userId = req.headers['x-user-id'] || req.query.userId; // Get userId from header or query
+    
+    const key = `news:${id}`;
+    const article = await redis.json.get(key);
+
+    if (!article) {
+      return res.status(404).json({ error: 'Article not found' });
+    }
+
+    // Mark article as read if userId is provided
+    if (userId) {
+      await markArticleAsRead(userId, id);
+      
+      // Clear personalized cache for this user since read list changed
+      await clearPersonalizedCache(userId);
+    }
+
+    res.json(article);
+  } catch (error) {
+    console.error('Error fetching article:', error);
+    res.status(500).json({ error: 'Failed to fetch article' });
+  }
+}
+
+// Enhanced getPersonalizedNews with read filtering
+async function getPersonalizedNews(userId, limit = 10, offset = 0, options = {}) {
+  try {
+    const {
+      forceRefresh = false,
+      cacheTimeout = 1800, // 30 minutes
+      includeCacheStats = false
+    } = options;
+
+    // Simple cache keys
+    const cacheKey = `personalized_simple:${userId}:${limit}:${offset}`;
+    const prefsVersionKey = `prefs_version_simple:${userId}`;
+    const statsKey = `personalized_stats_simple:${userId}`;
+
+    // Check cache first
+    if (!forceRefresh) {
+      try {
+        const [cachedData, prefsVersion] = await Promise.all([
+          redis.json.get(cacheKey).catch(() => null),
+          redis.get(prefsVersionKey).catch(() => null)
+        ]);
+        
+        if (cachedData?.results) {
+          // Validate cache with current preferences
+          const userPrefs = await getUserPreferences(userId);
+          const currentPrefsHash = userPrefs ? 
+            require('crypto').createHash('md5').update(JSON.stringify(userPrefs.preferences)).digest('hex') : 'none';
+          
+          if (prefsVersion === currentPrefsHash) {
+            // Filter out read articles from cached results
+            const filteredResults = await filterReadArticles(userId, cachedData.results);
+            
+            // If significant articles were filtered out, refresh cache
+            const filteredCount = cachedData.results.length - filteredResults.length;
+            if (filteredCount > limit * 0.3) { // If more than 30% filtered, refresh
+              console.log(`Too many read articles filtered (${filteredCount}), refreshing cache`);
+            } else {
+              await redis.hIncrBy(statsKey, 'cache_hits', 1);
+              console.log(`Cache HIT for personalized news: ${userId} (${filteredCount} read articles filtered)`);
+              
+              const response = {
+                articles: filteredResults.slice(offset, offset + limit),
+                totalCount: filteredResults.length,
+                cached: true,
+                filteredReadCount: filteredCount
+              };
+
+              if (includeCacheStats) {
+                const stats = await redis.hGetAll(statsKey);
+                response.cacheStats = {
+                  hits: parseInt(stats.cache_hits || 0),
+                  misses: parseInt(stats.cache_misses || 0)
+                };
+              }
+
+              return response;
+            }
+          }
+        }
+      } catch (cacheError) {
+        console.log('Cache check failed:', cacheError);
+      }
+    }
+
+    // Cache miss or needs refresh
+    await redis.hIncrBy(statsKey, 'cache_misses', 1);
+    console.log(`Cache MISS for personalized news: ${userId}`);
+
+    // Get user preferences
     const userPrefs = await getUserPreferences(userId);
     
-    if (!userPrefs || !userPrefs.preferences || userPrefs.preferences.length === 0) {
-      // Fallback to general articles if no preferences
-      return getAllArticles(limit, offset);
+    if (!userPrefs?.preferences?.length) {
+      console.log(`No preferences for user ${userId}, using general articles`);
+      const generalResult = await getAllArticles(limit + offset + 20, 0); // Get extra to account for filtering
+      const filteredArticles = await filterReadArticles(userId, generalResult.articles);
+      
+      return {
+        articles: filteredArticles.slice(offset, offset + limit),
+        totalCount: filteredArticles.length,
+        cached: false,
+        fallback: true,
+        filteredReadCount: generalResult.articles.length - filteredArticles.length
+      };
     }
 
     const { preferences } = userPrefs;
-    
-    // Use vector search for each preference and combine results
-    const allVectorResults = [];
-    
-    for (const preference of preferences) {
+    console.log(`Processing ${preferences.length} preferences for user ${userId}`);
+
+    // Get articles for each preference using vectorSearchSimilarNews
+    const allResults = [];
+    const seenArticles = new Set();
+    const articlesPerPreference = Math.ceil((limit + offset + 40) / preferences.length); // Get more to account for filtering
+
+    for (let i = 0; i < preferences.length; i++) {
+      const preference = preferences[i];
+      
       try {
-        // Use vector search for each preference with lower threshold for more results
-        const vectorResults = await vectorSearchSimilarNews(preference, limit * 2, 0.3, {});
+        console.log(`Searching for preference: "${preference}"`);
         
-        // Add preference info to each result
-        const resultsWithPreference = vectorResults.map(article => ({
-          ...article,
-          personalized: true,
-          matched_preference: preference,
-          similarity_score: article.similarity
-        }));
+        const vectorResults = await vectorSearchSimilarNews(
+          preference,
+          limit + offset + 20, // Get more results
+          0.4,
+          {},
+          null
+        );
+
+        const preferenceWeight = 1 - (i * 0.1);
         
-        allVectorResults.push(...resultsWithPreference);
-      } catch (vectorError) {
-        console.error(`Vector search failed for preference "${preference}":`, vectorError);
-        // Fallback to text search for this preference
-        const textResults = await searchArticlesByTopic(preference, limit, 0);
-        const textResultsWithPreference = textResults.articles.map(article => ({
-          ...article,
-          personalized: true,
-          matched_preference: preference,
-          search_method: 'text'
-        }));
-        allVectorResults.push(...textResultsWithPreference);
+        for (const article of vectorResults) {
+          if (!seenArticles.has(article.id)) {
+            seenArticles.add(article.id);
+            allResults.push({
+              ...article,
+              matched_preference: preference,
+              preference_order: i,
+              preference_weight: preferenceWeight,
+              final_score: article.similarity * preferenceWeight
+            });
+          }
+        }
+        
+        console.log(`Found ${vectorResults.length} articles for "${preference}"`);
+        
+      } catch (error) {
+        console.error(`Error searching for preference "${preference}":`, error);
       }
     }
+
+    // Sort by final score
+    let sortedResults = allResults.sort((a, b) => b.final_score - a.final_score);
+
+    // Filter out read articles
+    const originalCount = sortedResults.length;
+    sortedResults = await filterReadArticles(userId, sortedResults);
+    const filteredReadCount = originalCount - sortedResults.length;
+
+    // Add general articles if we don't have enough after filtering
+    let finalResults = sortedResults;
+    const personalizedCount = sortedResults.length;
     
-    // Remove duplicates and rank by similarity
-    const uniqueArticles = new Map();
+    if (sortedResults.length < limit + offset + 10) {
+      const needed = (limit + offset + 15) - sortedResults.length;
+      const existingIds = new Set(sortedResults.map(a => a.id));
+      
+      try {
+        const generalResult = await getAllArticles(needed * 2, 0);
+        let generalArticles = generalResult.articles
+          .filter(article => !existingIds.has(article.id));
+        
+        // Filter read articles from general articles too
+        generalArticles = await filterReadArticles(userId, generalArticles);
+        
+        generalArticles = generalArticles
+          .slice(0, needed)
+          .map(article => ({
+            ...article,
+            matched_preference: 'general',
+            preference_order: 999,
+            final_score: 0.1
+          }));
+        
+        finalResults = [...sortedResults, ...generalArticles];
+        console.log(`Added ${generalArticles.length} general articles (after read filtering)`);
+      } catch (generalError) {
+        console.error('Error getting general articles:', generalError);
+      }
+    }
+
+    const totalCount = finalResults.length;
+
+    // Cache the results (before read filtering for future cache hits)
+    const prefsHash = require('crypto').createHash('md5').update(JSON.stringify(preferences)).digest('hex');
     
-    for (const article of allVectorResults) {
-      if (!uniqueArticles.has(article.id)) {
-        uniqueArticles.set(article.id, article);
-      } else {
-        // If article already exists, keep the one with higher similarity
-        const existing = uniqueArticles.get(article.id);
-        if (article.similarity_score > existing.similarity_score) {
-          uniqueArticles.set(article.id, article);
+    const cacheData = {
+      results: allResults.sort((a, b) => b.final_score - a.final_score), // Cache all results
+      totalCount: allResults.length,
+      personalizedCount: personalizedCount,
+      timestamp: Date.now()
+    };
+
+    // Cache with pipeline
+    const pipeline = redis.multi();
+    pipeline.json.set(cacheKey, '$', cacheData);
+    pipeline.expire(cacheKey, cacheTimeout);
+    pipeline.set(prefsVersionKey, prefsHash, 'EX', cacheTimeout);
+    await pipeline.exec();
+
+    console.log(`Cached personalized news for user ${userId}: ${personalizedCount}/${totalCount} personalized, ${filteredReadCount} read articles filtered`);
+
+    // Return final response
+    const response = {
+      articles: finalResults.slice(offset, offset + limit),
+      totalCount: totalCount,
+      personalizedCount: personalizedCount,
+      cached: false,
+      preferencesProcessed: preferences.length,
+      filteredReadCount: filteredReadCount
+    };
+
+    if (includeCacheStats) {
+      const stats = await redis.hGetAll(statsKey);
+      response.cacheStats = {
+        hits: parseInt(stats.cache_hits || 0),
+        misses: parseInt(stats.cache_misses || 0)
+      };
+    }
+
+    return response;
+
+  } catch (error) {
+    console.error('Error in getPersonalizedNews:', error);
+    
+    // Fallback to general articles with read filtering
+    try {
+      const generalResult = await getAllArticles(limit + offset + 10, 0);
+      const filteredArticles = await filterReadArticles(userId, generalResult.articles);
+      
+      return {
+        articles: filteredArticles.slice(offset, offset + limit),
+        totalCount: filteredArticles.length,
+        cached: false,
+        fallback: true,
+        error: error.message,
+        filteredReadCount: generalResult.articles.length - filteredArticles.length
+      };
+    } catch (fallbackError) {
+      return {
+        articles: [],
+        totalCount: 0,
+        cached: false,
+        error: `${error.message}; ${fallbackError.message}`
+      };
+    }
+  }
+}
+
+// Enhanced getPersonalizedNewsSearch with read filtering
+async function getPersonalizedNewsSearch(userId, limit = 10, offset = 0, searchQuery = '', sentiment = null, source = null, options = {}) {
+  try {
+    const {
+      forceRefresh = false,
+      cacheTimeout = 900,
+      includeCacheStats = false,
+      similarityThreshold = 0.3,
+      personalizedLimit = Math.max(100, limit * 8)
+    } = options;
+
+    const searchParams = { q: searchQuery || '', sentiment: sentiment || '', source: source || '' };
+    const searchHash = require('crypto').createHash('md5').update(JSON.stringify(searchParams)).digest('hex');
+    const cacheKey = `personalized_search_simple:${userId}:${searchHash}:${limit}:${offset}`;
+    const statsKey = `personalized_search_stats_simple:${userId}`;
+
+    // Check cache first
+    if (!forceRefresh) {
+      try {
+        const cachedData = await redis.json.get(cacheKey);
+        if (cachedData?.results) {
+          // Filter out read articles from cached results
+          const filteredResults = await filterReadArticles(userId, cachedData.results);
+          const filteredCount = cachedData.results.length - filteredResults.length;
+          
+          // If too many articles filtered, refresh cache
+          if (filteredCount > limit * 0.3) {
+            console.log(`Too many read articles in search cache (${filteredCount}), refreshing`);
+          } else {
+            await redis.hIncrBy(statsKey, 'cache_hits', 1);
+            console.log(`Cache HIT for personalized search: ${userId} - "${searchQuery}" (${filteredCount} read filtered)`);
+            
+            const response = {
+              articles: filteredResults.slice(offset, offset + limit),
+              totalCount: filteredResults.length,
+              cached: true,
+              searchQuery: searchQuery,
+              filters: { sentiment, source },
+              filteredReadCount: filteredCount
+            };
+
+            if (includeCacheStats) {
+              const stats = await redis.hGetAll(statsKey);
+              response.cacheStats = {
+                hits: parseInt(stats.cache_hits || 0),
+                misses: parseInt(stats.cache_misses || 0)
+              };
+            }
+
+            return response;
+          }
+        }
+      } catch (cacheError) {
+        console.log('Cache check failed:', cacheError);
+      }
+    }
+
+    // Cache miss or needs refresh
+    await redis.hIncrBy(statsKey, 'cache_misses', 1);
+    console.log(`Cache MISS for personalized search: ${userId} - "${searchQuery}"`);
+
+    // Get personalized articles with extra buffer for read filtering
+    const personalizedResult = await getPersonalizedNews(
+      userId, 
+      personalizedLimit + 20, // Extra buffer
+      0, 
+      { forceRefresh, cacheTimeout: cacheTimeout * 2 }
+    );
+
+    let searchResults = personalizedResult.articles || [];
+
+    // Apply search filtering
+    if (searchQuery && searchQuery.trim()) {
+      console.log(`Filtering ${searchResults.length} personalized articles for: "${searchQuery}"`);
+      
+      try {
+        const searchVector = await generateEmbedding(searchQuery.trim());
+        
+        if (searchVector && Array.isArray(searchVector)) {
+          const articlesWithSimilarity = [];
+          
+          for (const article of searchResults) {
+            if (article.vector && Array.isArray(article.vector)) {
+              const similarity = calculateCosineSimilarity(searchVector, article.vector);
+              
+              if (similarity >= similarityThreshold) {
+                articlesWithSimilarity.push({
+                  ...article,
+                  search_similarity: similarity,
+                  search_query: searchQuery.trim(),
+                  search_method: 'semantic_filter'
+                });
+              }
+            } else {
+              const textContent = `${article.title || ''} ${article.description || ''} ${article.content || ''}`.toLowerCase();
+              const queryWords = searchQuery.toLowerCase().split(/\s+/);
+              const matchScore = queryWords.reduce((score, word) => {
+                return score + (textContent.includes(word) ? 1 : 0);
+              }, 0) / queryWords.length;
+              
+              if (matchScore > 0.3) {
+                articlesWithSimilarity.push({
+                  ...article,
+                  search_similarity: matchScore * 0.7,
+                  search_query: searchQuery.trim(),
+                  search_method: 'text_filter'
+                });
+              }
+            }
+          }
+          
+          searchResults = articlesWithSimilarity.sort((a, b) => {
+            const simDiff = (b.search_similarity || 0) - (a.search_similarity || 0);
+            if (Math.abs(simDiff) > 0.1) return simDiff;
+            return (b.final_score || 0) - (a.final_score || 0);
+          });
+          
+          console.log(`Found ${searchResults.length} semantically similar articles`);
+        } else {
+          console.log('Failed to generate search embedding, using text fallback');
+          const queryWords = searchQuery.toLowerCase().split(/\s+/);
+          searchResults = searchResults.filter(article => {
+            const textContent = `${article.title || ''} ${article.description || ''}`.toLowerCase();
+            return queryWords.some(word => textContent.includes(word));
+          }).map(article => ({
+            ...article,
+            search_similarity: 0.5,
+            search_query: searchQuery.trim(),
+            search_method: 'text_fallback'
+          }));
+        }
+      } catch (searchError) {
+        console.error('Error in semantic search filtering:', searchError);
+        searchResults = searchResults.map(article => ({
+          ...article,
+          search_similarity: 0.3,
+          search_query: searchQuery.trim(),
+          search_method: 'error_fallback'
+        }));
+      }
+    }
+
+    // Apply additional filters
+    if (sentiment || source) {
+      searchResults = searchResults.filter(article => {
+        if (sentiment && article.sentiment !== sentiment) return false;
+        if (source && article.source !== source) return false;
+        return true;
+      });
+    }
+
+    const totalCount = searchResults.length;
+
+    // Cache the results
+    const cacheData = {
+      results: searchResults,
+      totalCount: totalCount,
+      timestamp: Date.now(),
+      searchQuery: searchQuery,
+      filters: { sentiment, source },
+      personalizedCount: personalizedResult.personalizedCount || 0
+    };
+
+    try {
+      await redis.json.set(cacheKey, '$', cacheData);
+      await redis.expire(cacheKey, cacheTimeout);
+      console.log(`Cached personalized search results: ${userId} - "${searchQuery}" (${totalCount} articles)`);
+    } catch (cacheError) {
+      console.error('Failed to cache search results:', cacheError);
+    }
+
+    const response = {
+      articles: searchResults.slice(offset, offset + limit),
+      totalCount: totalCount,
+      cached: false,
+      searchQuery: searchQuery,
+      filters: { sentiment, source },
+      personalizedCount: personalizedResult.personalizedCount || 0,
+      searchMethod: searchQuery ? 'personalized_semantic_search' : 'personalized_filtered',
+      filteredReadCount: personalizedResult.filteredReadCount || 0
+    };
+
+    if (includeCacheStats) {
+      const stats = await redis.hGetAll(statsKey);
+      response.cacheStats = {
+        hits: parseInt(stats.cache_hits || 0),
+        misses: parseInt(stats.cache_misses || 0)
+      };
+    }
+
+    return response;
+
+  } catch (error) {
+    console.error('Error in getPersonalizedNewsSearch:', error);
+    
+    try {
+      const fallbackResult = await getPersonalizedNews(userId, limit + offset, 0);
+      return {
+        articles: fallbackResult.articles.slice(offset, offset + limit),
+        totalCount: fallbackResult.totalCount || 0,
+        cached: false,
+        fallback: true,
+        error: error.message,
+        searchQuery: searchQuery,
+        filters: { sentiment, source }
+      };
+    } catch (fallbackError) {
+      return {
+        articles: [],
+        totalCount: 0,
+        cached: false,
+        error: `${error.message}; ${fallbackError.message}`,
+        searchQuery: searchQuery,
+        filters: { sentiment, source }
+      };
+    }
+  }
+}
+
+// Simple cache clearing function
+async function clearPersonalizedCache(userId) {
+  try {
+    console.log("clearPersonalizedCache", userId);
+    const keys = await redis.keys(`personalized_simple:${userId}:*`);
+    const versionKey = `prefs_version_simple:${userId}`;
+    
+    if (keys.length > 0) {
+      await redis.del([...keys, versionKey]);
+    }
+    
+    console.log(`Cleared simple personalized cache for user: ${userId}`);
+    return true;
+  } catch (error) {
+    console.error('Error clearing simple personalized cache:', error);
+    return false;
+  }
+}
+
+// Helper function for cosine similarity calculation
+function calculateCosineSimilarity(vectorA, vectorB) {
+  if (!vectorA || !vectorB || vectorA.length !== vectorB.length) {
+    return 0;
+  }
+  
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  
+  for (let i = 0; i < vectorA.length; i++) {
+    dotProduct += vectorA[i] * vectorB[i];
+    normA += vectorA[i] * vectorA[i];
+    normB += vectorB[i] * vectorB[i];
+  }
+  
+  if (normA === 0 || normB === 0) {
+    return 0;
+  }
+  
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+// Helper function to get all articles with filters (implement based on your needs)
+async function getAllArticlesWithFilters(limit = 10, offset = 0, filters = {}) {
+  try {
+    // This should filter your getAllArticles function based on the provided filters
+    // For now, falling back to general getAllArticles
+    return await getAllArticles(limit, offset);
+  } catch (error) {
+    console.error('Error in getAllArticlesWithFilters:', error);
+    throw error;
+  }
+}
+
+// Function to clear personalized search cache for a user
+async function clearPersonalizedSearchCache(userId) {
+  try {
+    const pattern = `personalized_search:${userId}:*`;
+    const keys = await redis.keys(pattern);
+    
+    if (keys.length > 0) {
+      await redis.del(keys);
+      console.log(`Cleared ${keys.length} personalized search cache entries for user: ${userId}`);
+    }
+    
+    // Also clear metadata cache
+    const metaPattern = `personalized_search_meta:${userId}:*`;
+    const metaKeys = await redis.keys(metaPattern);
+    
+    if (metaKeys.length > 0) {
+      await redis.del(metaKeys);
+      console.log(`Cleared ${metaKeys.length} personalized search metadata cache entries for user: ${userId}`);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('Error clearing personalized search cache:', error);
+    return false;
+  }
+}
+
+
+
+// Enhanced user preferences update with cache invalidation
+async function updateUserPreferences(userId, preferences) {
+  try {
+    const key = `user:${userId}:preferences`;
+    const exists = await redis.exists(key);
+    
+    // Store/update preferences
+    if (exists) {
+      await redis.json.set(key, '$.preferences', preferences);
+      await redis.json.set(key, '$.updatedAt', new Date().toISOString());
+    } else {
+      await storeUserPreferences(userId, preferences);
+    }
+    
+    // Invalidate all cached personalized content for this user
+    await clearPersonalizedCache(userId);
+    
+    console.log(`Updated preferences and cleared cache for user: ${userId}`);
+    return true;
+  } catch (error) {
+    console.error('Error updating user preferences:', error);
+    return false;
+  }
+}
+
+// Get personalized news cache statistics
+async function getPersonalizedCacheStats(userId = null) {
+  try {
+    const stats = {};
+    
+    if (userId) {
+      // Get stats for specific user
+      const statsKey = `personalized_stats:${userId}`;
+      const userStats = await redis.hGetAll(statsKey);
+      stats.user = {
+        id: userId,
+        hits: parseInt(userStats.cache_hits || 0),
+        misses: parseInt(userStats.cache_misses || 0),
+        totalRequests: parseInt(userStats.total_requests || 0),
+        hitRate: userStats.total_requests ? 
+          (parseInt(userStats.cache_hits || 0) / parseInt(userStats.total_requests)) * 100 : 0
+      };
+      
+      // Check if user has active cache
+      const cacheKeys = await redis.keys(`personalized:${userId}:*`);
+      stats.user.activeCacheEntries = cacheKeys.length;
+      
+      // Get last cache timestamp
+      if (cacheKeys.length > 0) {
+        const metaKey = `personalized_meta:${userId}`;
+        const metaData = await redis.json.get(metaKey);
+        if (metaData) {
+          stats.user.lastCached = new Date(metaData.timestamp);
+          stats.user.cacheAge = Date.now() - metaData.timestamp;
         }
       }
     }
     
-    // Sort by similarity score (highest first) and apply pagination
-    const sortedArticles = Array.from(uniqueArticles.values())
-      .sort((a, b) => (b.similarity_score || 0) - (a.similarity_score || 0))
-      .slice(offset, offset + limit);
+    // Get overall personalized cache stats
+    const lruKey = 'personalized_cache_lru';
+    const totalCached = await redis.zCard(lruKey);
+    const oldestCache = await redis.zRange(lruKey, 0, 0, { WITHSCORES: true });
+    const newestCache = await redis.zRange(lruKey, -1, -1, { WITHSCORES: true });
     
-    // If we don't have enough personalized results, mix with general articles
-    if (sortedArticles.length < limit) {
-      const remainingLimit = limit - sortedArticles.length;
-      const existingIds = new Set(sortedArticles.map(a => a.id));
-      
-      const generalResult = await getAllArticles(remainingLimit * 2, 0);
-      const generalArticles = generalResult.articles
-        .filter(article => !existingIds.has(article.id))
-        .slice(0, remainingLimit)
-        .map(article => ({ 
-          ...article, 
-          personalized: false,
-          search_method: 'general'
-        }));
-      
-      sortedArticles.push(...generalArticles);
+    stats.overall = {
+      totalCachedUsers: totalCached,
+      oldestCacheTime: oldestCache.length > 0 ? new Date(oldestCache[0].score) : null,
+      newestCacheTime: newestCache.length > 0 ? new Date(newestCache[0].score) : null
+    };
+    
+    // Get daily unique users served personalized content
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const uniqueToday = await redis.pfCount(`personalized_users:${today}`);
+      stats.daily = {
+        date: today,
+        uniqueUsersServed: uniqueToday
+      };
+    } catch (hllError) {
+      stats.daily = { error: 'HyperLogLog not available' };
     }
     
-    return {
-      articles: sortedArticles.slice(0, limit),
-      totalCount: uniqueArticles.size
-    };
+    return stats;
   } catch (error) {
-    console.error('Error getting personalized news:', error);
-    // Fallback to regular articles
-    return getAllArticles(limit, offset);
+    console.error('Error getting personalized cache stats:', error);
+    return { error: error.message };
+  }
+}
+
+// Clear personalized cache for specific user or all users
+async function clearPersonalizedCache(userId = null, options = {}) {
+  try {
+    const { clearStats = false, clearFallbacks = true } = options;
+    
+    if (userId) {
+      // Clear cache for specific user
+      const patterns = [
+        `personalized:${userId}:*`,
+        `personalized_meta:${userId}`,
+        `prefs_version:${userId}`
+      ];
+      
+      if (clearFallbacks) {
+        patterns.push(`fallback:${userId}:*`, `personalized_fallback:${userId}`);
+      }
+      
+      let totalCleared = 0;
+      
+      for (const pattern of patterns) {
+        const keys = await redis.keys(pattern);
+        if (keys.length > 0) {
+          await redis.del(keys);
+          totalCleared += keys.length;
+        }
+      }
+      
+      if (clearStats) {
+        await redis.del(`personalized_stats:${userId}`);
+        totalCleared += 1;
+      }
+      
+      // Remove from LRU management
+      const lruKey = 'personalized_cache_lru';
+      const lruKeys = await redis.zRange(lruKey, 0, -1);
+      const keysToRemove = lruKeys.filter(key => key.includes(userId));
+      if (keysToRemove.length > 0) {
+        await redis.zRem(lruKey, keysToRemove);
+      }
+      
+      console.log(`Cleared personalized cache for user: ${userId} (${totalCleared} keys)`);
+      return { cleared: totalCleared, userId };
+    } else {
+      // Clear all personalized caches
+      const patterns = [
+        'personalized:*', 
+        'personalized_meta:*', 
+        'prefs_version:*', 
+        'personalized_cache_lru'
+      ];
+      
+      if (clearFallbacks) {
+        patterns.push('fallback:*', 'personalized_fallback:*');
+      }
+      
+      let totalCleared = 0;
+      
+      for (const pattern of patterns) {
+        const keys = await redis.keys(pattern);
+        if (keys.length > 0) {
+          await redis.del(keys);
+          totalCleared += keys.length;
+        }
+      }
+      
+      if (clearStats) {
+        const statsKeys = await redis.keys('personalized_stats:*');
+        if (statsKeys.length > 0) {
+          await redis.del(statsKeys);
+          totalCleared += statsKeys.length;
+        }
+      }
+      
+      console.log(`Cleared all personalized caches: ${totalCleared} keys`);
+      return { cleared: totalCleared, scope: 'all' };
+    }
+  } catch (error) {
+    console.error('Error clearing personalized cache:', error);
+    return { error: error.message };
   }
 }
 
@@ -1265,6 +1958,39 @@ async function getAllArticles(limit = 10, offset = 0) {
   }
 }
 
+
+async function getAllSources() {
+  try {
+    const test = await redis.ft.search('idx:news', '@source:{GlobeNewswire}', {
+      DIALECT: 2
+    });
+    
+    console.log(test.total);
+    const results = await redis.ft.aggregate('idx:news', '*', {
+      GROUPBY: ['@source'],
+      LOAD: ['@source'],        // <- REQUIRED to actually return grouped field
+      DIALECT: 2
+    });
+
+    const sources = [];
+
+    if (results && results.rows) {
+      for (const row of results.rows) {
+        const source = row?.value?.source;
+        if (source && typeof source === 'string') {
+          sources.push(source);
+        }
+      }
+    }
+
+    console.log(`Found ${sources.length} unique sources`);
+    return [...new Set(sources)].sort(); // deduplicate and sort alphabetically
+  } catch (error) {
+    console.error('Error fetching sources:', error);
+    return [];
+  }
+}
+
 module.exports = {
   redis,
   searchArticlesByTopic,
@@ -1279,7 +2005,10 @@ module.exports = {
   // Add these new exports
   storeUserPreferences,
   getUserPreferences,
+  clearPersonalizedCache,
   updateUserPreferences,
   getPersonalizedNews,
-  vectorSearchSimilarNews
+  getPersonalizedNewsSearch,
+  getAllSources,
+  markArticleAsRead
 };
