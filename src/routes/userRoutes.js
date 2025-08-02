@@ -8,7 +8,8 @@ const {
   getUserPreferences,
   updateUserPreferences,
   getPersonalizedNews,
-  getPersonalizedNewsSearch
+  getPersonalizedNewsSearch,
+  getUserArticleHistory
 } = require('../controllers/newsController');
 
 // User routes
@@ -18,5 +19,6 @@ router.get('/:userId/preferences', getUserPreferences);
 router.put('/:userId/preferences', updateUserPreferences);
 router.get('/:userId/personalized-news', getPersonalizedNews);
 router.get('/:userId/personalized-news/search', getPersonalizedNewsSearch);
+router.get('/:userId/history', getUserArticleHistory);
 
 module.exports = router; 

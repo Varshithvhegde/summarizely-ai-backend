@@ -8,13 +8,18 @@ const {
   searchNews,
   getArticleById,
   getSimilarArticles,
-  getAllNews
+  getAllNews,
+  getArticleMetrics,
+  getUserArticleHistory,
+  getTrendingArticles
 } = require('../controllers/newsController');
 
 // News routes (specific routes first)
 router.get('/topic/:topic', getNewsByTopic);
 router.get('/sentiment/:sentiment', getNewsBySentiment);
 router.get('/search', searchNews);
+router.get('/trending', getTrendingArticles);
+router.get('/:id/metrics', getArticleMetrics);
 router.get('/:id/similar', getSimilarArticles);
 router.get('/:id', getArticleById);
 

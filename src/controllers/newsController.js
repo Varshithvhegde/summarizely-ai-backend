@@ -20,7 +20,12 @@ const {
   // Add the new search functions
   searchNewsWithQuery,
   searchNewsWithTopicIntersection,
-  searchNews
+  searchNews,
+  getArticleMetrics,
+  getUserArticleHistory,
+  getTrendingArticles,
+  // Add article metrics tracking
+  trackArticleMetrics
 } = require('../services/redisService');
 const { getPaginationParams, createPaginatedResponse } = require('../utils/pagination');
 
@@ -95,18 +100,31 @@ async function searchNewsHandler(req, res) {
   }
 }
 
-// Get a single article by ID
+// Get a single article by ID with comprehensive metrics tracking
 async function getArticleById(req, res) {
   try {
     const { id } = req.params;
     const userId = req.headers['x-user-id'] || req.query.userId; // Get userId from header or query
-    console.log(userId);
+    const userAgent = req.headers['user-agent'] || 'unknown';
+    const ipAddress = req.ip || req.connection.remoteAddress;
+    
+    console.log(`Article view request - ID: ${id}, User: ${userId}, IP: ${ipAddress}`);
+    
     const key = `news:${id}`;
     const article = await redis.json.get(key);
 
     if (!article) {
       return res.status(404).json({ error: 'Article not found' });
     }
+
+    // Track comprehensive metrics
+    const metrics = await trackArticleMetrics(id, userId, {
+      userAgent,
+      ipAddress,
+      timestamp: Date.now(),
+      referrer: req.headers.referer || 'direct',
+      language: req.headers['accept-language'] || 'unknown'
+    });
 
     // Mark article as read if userId is provided
     if (userId) {
@@ -120,7 +138,20 @@ async function getArticleById(req, res) {
       });
     }
 
-    res.json(article);
+    console.log(metrics);
+    // Return article with metrics
+    const response = {
+      ...article,
+      metrics: {
+        totalViews: metrics.totalViews,
+        uniqueViews: metrics.uniqueViews,
+        userViews: metrics.userViews,
+        engagement: metrics.engagement,
+        lastViewed: metrics.lastViewed
+      }
+    };
+
+    res.json(response);
   } catch (error) {
     console.error('Error fetching article:', error);
     res.status(500).json({ error: 'Failed to fetch article' });
@@ -381,6 +412,58 @@ async function clearSimilarCache(req, res) {
   }
 }
 
+// Get article metrics (detailed analytics)
+async function getArticleMetricsHandler(req, res) {
+  try {
+    const { id } = req.params;
+    const metrics = await getArticleMetrics(id);
+    
+    res.json({
+      articleId: id,
+      metrics,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error fetching article metrics:', error);
+    res.status(500).json({ error: 'Failed to fetch article metrics' });
+  }
+}
+
+// Get user's article viewing history
+async function getUserArticleHistoryHandler(req, res) {
+  try {
+    const { userId } = req.params;
+    const history = await getUserArticleHistory(userId);
+    
+    res.json({
+      userId,
+      history,
+      totalArticles: history.length,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error fetching user article history:', error);
+    res.status(500).json({ error: 'Failed to fetch user article history' });
+  }
+}
+
+// Get trending articles
+async function getTrendingArticlesHandler(req, res) {
+  try {
+    const limit = parseInt(req.query.limit) || 10;
+    const trendingArticles = await getTrendingArticles(limit);
+    
+    res.json({
+      trendingArticles,
+      totalCount: trendingArticles.length,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error fetching trending articles:', error);
+    res.status(500).json({ error: 'Failed to fetch trending articles' });
+  }
+}
+
 // Health check
 async function healthCheck(req, res) {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
@@ -404,5 +487,8 @@ module.exports = {
   getPersonalizedNewsSearch: getPersonalizedNewsSearchHandler,
   getSimilarStats,
   clearSimilarCache,
+  getArticleMetrics: getArticleMetricsHandler,
+  getUserArticleHistory: getUserArticleHistoryHandler,
+  getTrendingArticles: getTrendingArticlesHandler,
   healthCheck
 };

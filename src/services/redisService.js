@@ -2152,6 +2152,251 @@ async function searchNews(filters, pagination) {
   }
 }
 
+// Article metrics tracking functions
+async function trackArticleMetrics(articleId, userId, metadata = {}) {
+  try {
+    const timestamp = Date.now();
+    const dateKey = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    
+    // Generate metric keys
+    const totalViewsKey = `article_views:${articleId}`;
+    const uniqueViewsKey = `article_unique_views:${articleId}`;
+    const userViewsKey = `article_user_views:${articleId}`;
+    const dailyViewsKey = `article_daily_views:${articleId}:${dateKey}`;
+    const engagementKey = `article_engagement:${articleId}`;
+    const lastViewedKey = `article_last_viewed:${articleId}`;
+    
+    // Execute operations and get values directly for reliability
+    const [totalViewsResult, dailyViewsResult] = await Promise.all([
+      redis.incr(totalViewsKey),
+      redis.hIncrBy(dailyViewsKey, 'views', 1)
+    ]);
+    
+    console.log('Total views result:', totalViewsResult);
+    console.log('Daily views result:', dailyViewsResult);
+    
+    // Use pipeline for other operations (non-critical for return values)
+    const pipeline = redis.multi();
+    
+    // Track unique views (by IP address)
+    const ipHash = metadata.ipAddress ? 
+      require('crypto').createHash('md5').update(metadata.ipAddress).digest('hex') : 
+      'unknown';
+    pipeline.sAdd(uniqueViewsKey, ipHash);
+    
+    // Track user-specific views (if userId provided)
+    if (userId) {
+      pipeline.sAdd(userViewsKey, userId);
+      pipeline.hSet(`user_article_views:${userId}`, articleId, timestamp);
+    }
+    
+    // Set expiration for daily views
+    pipeline.expire(dailyViewsKey, 86400 * 30); // 30 days
+    
+    // Track engagement metrics
+    const engagementData = {
+      timestamp,
+      userAgent: metadata.userAgent || 'unknown',
+      referrer: metadata.referrer || 'direct',
+      language: metadata.language || 'unknown',
+      userId: userId || 'anonymous'
+    };
+    pipeline.lPush(engagementKey, JSON.stringify(engagementData));
+    pipeline.lTrim(engagementKey, 0, 999); // Keep last 1000 engagement records
+    pipeline.expire(engagementKey, 86400 * 7); // 7 days
+    
+    // Update last viewed timestamp
+    pipeline.set(lastViewedKey, timestamp);
+    
+    // Execute remaining operations
+    await pipeline.exec();
+    
+    const totalViews = totalViewsResult;
+    const dailyViews = dailyViewsResult;
+    
+    const uniqueViewsCount = await redis.sCard(uniqueViewsKey);
+    const userViewsCount = userId ? await redis.sCard(userViewsKey) : 0;
+    
+    // Calculate engagement score (based on recent activity)
+    const recentEngagement = await redis.lRange(engagementKey, 0, 9); // Last 10 interactions
+    const engagementScore = recentEngagement.length;
+    
+    const metrics = {
+      totalViews,
+      uniqueViews: uniqueViewsCount,
+      userViews: userViewsCount,
+      dailyViews,
+      engagement: engagementScore,
+      lastViewed: timestamp
+    };
+    
+    console.log('Final metrics object:', JSON.stringify(metrics, null, 2));
+    
+    return metrics;
+    
+  } catch (error) {
+    console.error('Error tracking article metrics:', error);
+    return {
+      totalViews: 0,
+      uniqueViews: 0,
+      userViews: 0,
+      dailyViews: 0,
+      engagement: 0,
+      lastViewed: Date.now()
+    };
+  }
+}
+
+// Get article metrics
+async function getArticleMetrics(articleId) {
+  try {
+    const dateKey = new Date().toISOString().split('T')[0];
+    
+    const totalViewsKey = `article_views:${articleId}`;
+    const uniqueViewsKey = `article_unique_views:${articleId}`;
+    const userViewsKey = `article_user_views:${articleId}`;
+    const dailyViewsKey = `article_daily_views:${articleId}:${dateKey}`;
+    const engagementKey = `article_engagement:${articleId}`;
+    const lastViewedKey = `article_last_viewed:${articleId}`;
+    
+    // Get all metrics in parallel
+    const [
+      totalViews,
+      uniqueViewsCount,
+      userViewsCount,
+      dailyViews,
+      lastViewed,
+      recentEngagement
+    ] = await Promise.all([
+      redis.get(totalViewsKey).then(val => parseInt(val) || 0),
+      redis.sCard(uniqueViewsKey),
+      redis.sCard(userViewsKey),
+      redis.hGet(dailyViewsKey, 'views').then(val => parseInt(val) || 0),
+      redis.get(lastViewedKey).then(val => parseInt(val) || 0),
+      redis.lRange(engagementKey, 0, 49) // Last 50 interactions
+    ]);
+    
+    // Calculate engagement metrics
+    const engagementByHour = {};
+    const engagementByReferrer = {};
+    const engagementByLanguage = {};
+    
+    recentEngagement.forEach(record => {
+      try {
+        const data = JSON.parse(record);
+        const hour = new Date(data.timestamp).getHours();
+        engagementByHour[hour] = (engagementByHour[hour] || 0) + 1;
+        engagementByReferrer[data.referrer] = (engagementByReferrer[data.referrer] || 0) + 1;
+        engagementByLanguage[data.language] = (engagementByLanguage[data.language] || 0) + 1;
+      } catch (e) {
+        // Skip invalid records
+      }
+    });
+    
+    return {
+      totalViews,
+      uniqueViews: uniqueViewsCount,
+      userViews: userViewsCount,
+      dailyViews,
+      engagement: recentEngagement.length,
+      lastViewed,
+      engagementByHour,
+      engagementByReferrer,
+      engagementByLanguage,
+      recentActivity: recentEngagement.length
+    };
+    
+  } catch (error) {
+    console.error('Error getting article metrics:', error);
+    return {
+      totalViews: 0,
+      uniqueViews: 0,
+      userViews: 0,
+      dailyViews: 0,
+      engagement: 0,
+      lastViewed: 0,
+      engagementByHour: {},
+      engagementByReferrer: {},
+      engagementByLanguage: {},
+      recentActivity: 0
+    };
+  }
+}
+
+// Get user's article viewing history
+async function getUserArticleHistory(userId) {
+  try {
+    const userViewsKey = `user_article_views:${userId}`;
+    const userViews = await redis.hGetAll(userViewsKey);
+    
+    const articleHistory = [];
+    for (const [articleId, timestamp] of Object.entries(userViews)) {
+      const article = await redis.json.get(`news:${articleId}`).catch(() => null);
+      if (article) {
+        articleHistory.push({
+          articleId,
+          title: article.title,
+          viewedAt: parseInt(timestamp),
+          source: article.source?.name || 'unknown'
+        });
+      }
+    }
+    
+    // Sort by most recent first
+    articleHistory.sort((a, b) => b.viewedAt - a.viewedAt);
+    
+    return articleHistory;
+    
+  } catch (error) {
+    console.error('Error getting user article history:', error);
+    return [];
+  }
+}
+
+// Get trending articles (most viewed in last 24 hours)
+async function getTrendingArticles(limit = 10) {
+  try {
+    const dateKey = new Date().toISOString().split('T')[0];
+    const yesterdayKey = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    
+    // Get all article IDs
+    const articleKeys = await redis.keys('news:*');
+    const trendingArticles = [];
+    
+    for (const key of articleKeys) {
+      const articleId = key.replace('news:', '');
+      const dailyViewsKey = `article_daily_views:${articleId}:${dateKey}`;
+      const yesterdayViewsKey = `article_daily_views:${articleId}:${yesterdayKey}`;
+      
+      const [todayViews, yesterdayViews] = await Promise.all([
+        redis.hGet(dailyViewsKey, 'views').then(val => parseInt(val) || 0),
+        redis.hGet(yesterdayViewsKey, 'views').then(val => parseInt(val) || 0)
+      ]);
+      
+      if (todayViews > 0) {
+        const article = await redis.json.get(key);
+        if (article) {
+          trendingArticles.push({
+            ...article,
+            todayViews,
+            yesterdayViews,
+            growth: yesterdayViews > 0 ? ((todayViews - yesterdayViews) / yesterdayViews * 100) : 0
+          });
+        }
+      }
+    }
+    
+    // Sort by today's views (descending)
+    trendingArticles.sort((a, b) => b.todayViews - a.todayViews);
+    
+    return trendingArticles.slice(0, limit);
+    
+  } catch (error) {
+    console.error('Error getting trending articles:', error);
+    return [];
+  }
+}
+
 module.exports = {
   redis,
   searchArticlesByTopic,
@@ -2175,5 +2420,10 @@ module.exports = {
   // Add the new search functions
   searchNewsWithQuery,
   searchNewsWithTopicIntersection,
-  searchNews
+  searchNews,
+  // Add article metrics functions
+  trackArticleMetrics,
+  getArticleMetrics,
+  getUserArticleHistory,
+  getTrendingArticles
 };
