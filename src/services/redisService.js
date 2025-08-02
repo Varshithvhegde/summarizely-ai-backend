@@ -342,9 +342,9 @@ async function getPersonalizedNews(userId, limit = 10, offset = 0, options = {})
             
             // If significant articles were filtered out, refresh cache
             const filteredCount = cachedData.results.length - filteredResults.length;
-            if (filteredCount > limit * 0.3) { // If more than 30% filtered, refresh
-              console.log(`Too many read articles filtered (${filteredCount}), refreshing cache`);
-            } else {
+            // if (filteredCount > limit * 0.3) { // If more than 30% filtered, refresh
+            //   console.log(`Too many read articles filtered (${filteredCount}), refreshing cache`);
+            // } else {
               await redis.hIncrBy(statsKey, 'cache_hits', 1);
               console.log(`Cache HIT for personalized news: ${userId} (${filteredCount} read articles filtered)`);
               
@@ -365,7 +365,7 @@ async function getPersonalizedNews(userId, limit = 10, offset = 0, options = {})
 
               return response;
             }
-          }
+          
         }
       } catch (cacheError) {
         console.log('Cache check failed:', cacheError);
@@ -574,28 +574,28 @@ async function getPersonalizedNewsSearch(userId, limit = 10, offset = 0, searchQ
           if (filteredCount > limit * 0.3) {
             console.log(`Too many read articles in search cache (${filteredCount}), refreshing`);
           } else {
-            await redis.hIncrBy(statsKey, 'cache_hits', 1);
-            console.log(`Cache HIT for personalized search: ${userId} - "${searchQuery}" (${filteredCount} read filtered)`);
-            
-            const response = {
-              articles: filteredResults.slice(offset, offset + limit),
-              totalCount: filteredResults.length,
-              cached: true,
-              searchQuery: searchQuery,
-              filters: { sentiment, source },
-              filteredReadCount: filteredCount
+          await redis.hIncrBy(statsKey, 'cache_hits', 1);
+          console.log(`Cache HIT for personalized search: ${userId} - "${searchQuery}" (${filteredCount} read filtered)`);
+          
+          const response = {
+            articles: filteredResults.slice(offset, offset + limit),
+            totalCount: filteredResults.length,
+            cached: true,
+            searchQuery: searchQuery,
+            filters: { sentiment, source },
+            filteredReadCount: filteredCount
+          };
+
+          if (includeCacheStats) {
+            const stats = await redis.hGetAll(statsKey);
+            response.cacheStats = {
+              hits: parseInt(stats.cache_hits || 0),
+              misses: parseInt(stats.cache_misses || 0)
             };
-
-            if (includeCacheStats) {
-              const stats = await redis.hGetAll(statsKey);
-              response.cacheStats = {
-                hits: parseInt(stats.cache_hits || 0),
-                misses: parseInt(stats.cache_misses || 0)
-              };
-            }
-
-            return response;
           }
+
+          return response;
+        }
         }
       } catch (cacheError) {
         console.log('Cache check failed:', cacheError);
