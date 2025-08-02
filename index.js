@@ -1,10 +1,13 @@
 require('dotenv').config();
 const cron = require('node-cron');
-const { fetchNews } = require('./newsFetcher');
-const { summarizeAndAnalyze, generateEmbedding } = require('./geminiClient');
-const { storeArticle, articleExists } = require('./redisClient');
+const { fetchNews } = require('./src/services/newsFetcherService');
+const { summarizeAndAnalyze, generateEmbedding } = require('./src/services/geminiService');
+const { storeArticle, articleExists } = require('./src/services/redisService');
 const crypto = require('crypto');
 const axios = require('axios');
+
+// Start the API server
+require('./src/app');
 
 async function generateEmbedding1(text) {
   try {
@@ -95,8 +98,8 @@ async function processNews() {
   }
 }
 
-// Run every 10 minutes
-cron.schedule('*/10 * * * *', processNews);
+// // Run every 10 minutes
+// cron.schedule('*/10 * * * *', processNews);
 
-// Run once at startup
-processNews(); 
+// // Run once at startup
+// processNews(); 

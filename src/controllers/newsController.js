@@ -1,6 +1,4 @@
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
 const { 
   redis, 
   searchArticlesByTopic, 
@@ -23,65 +21,11 @@ const {
   searchNewsWithQuery,
   searchNewsWithTopicIntersection,
   searchNews
-} = require('./redisClient');
-
-
-const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-// Initialize search index on startup
-createSearchIndex();
-
-// Pagination helper function
-function getPaginationParams(req) {
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-  const offset = (page - 1) * limit;
-  
-  return { page, limit, offset };
-}
-
-// Create pagination response
-function createPaginatedResponse(articles, totalCount, page, limit, req) {
-  const totalPages = Math.ceil(totalCount / limit);
-  const hasNext = page < totalPages;
-  const hasPrev = page > 1;
-  
-  // Build base URL for pagination links
-  const baseUrl = `${req.protocol}://${req.get('host')}${req.path}`;
-  const queryParams = new URLSearchParams(req.query);
-  
-  // Remove page from query params for link building
-  queryParams.delete('page');
-  const baseQuery = queryParams.toString();
-  
-  return {
-    data: articles,
-    pagination: {
-      currentPage: page,
-      totalPages,
-      totalCount,
-      limit,
-      hasNext,
-      hasPrev,
-      nextPage: hasNext ? page + 1 : null,
-      prevPage: hasPrev ? page - 1 : null,
-      links: {
-        first: `${baseUrl}?${baseQuery ? baseQuery + '&' : ''}page=1`,
-        last: `${baseUrl}?${baseQuery ? baseQuery + '&' : ''}page=${totalPages}`,
-        next: hasNext ? `${baseUrl}?${baseQuery ? baseQuery + '&' : ''}page=${page + 1}` : null,
-        prev: hasPrev ? `${baseUrl}?${baseQuery ? baseQuery + '&' : ''}page=${page - 1}` : null
-      }
-    }
-  };
-}
+} = require('../services/redisService');
+const { getPaginationParams, createPaginatedResponse } = require('../utils/pagination');
 
 // Get news by topic (with pagination)
-app.get('/api/news/topic/:topic', async (req, res) => {
+async function getNewsByTopic(req, res) {
   try {
     const { topic } = req.params;
     const { page, limit, offset } = getPaginationParams(req);
@@ -100,10 +44,10 @@ app.get('/api/news/topic/:topic', async (req, res) => {
     console.error('Error fetching news by topic:', error);
     res.status(500).json({ error: 'Failed to fetch news' });
   }
-});
+}
 
 // Get news by sentiment (with pagination)
-app.get('/api/news/sentiment/:sentiment', async (req, res) => {
+async function getNewsBySentiment(req, res) {
   try {
     const { sentiment } = req.params;
     const { page, limit, offset } = getPaginationParams(req);
@@ -122,15 +66,15 @@ app.get('/api/news/sentiment/:sentiment', async (req, res) => {
     console.error('Error fetching news by sentiment:', error);
     res.status(500).json({ error: 'Failed to fetch news' });
   }
-});
+}
 
 // Search news with custom query (with pagination)
-app.get('/api/news/search', async (req, res) => {
+async function searchNewsHandler(req, res) {
   try {
     const { q, sentiment, source, topic } = req.query;
     const { page, limit, offset } = getPaginationParams(req);
     
-    // Use the comprehensive search function from redisClient
+    // Use the comprehensive search function from redisService
     const result = await searchNews(
       { q, sentiment, source, topic },
       { page, limit, offset }
@@ -149,14 +93,10 @@ app.get('/api/news/search', async (req, res) => {
     console.error('Error searching news:', error);
     res.status(500).json({ error: 'Failed to search news' });
   }
-});
-
-
-
-
+}
 
 // Get a single article by ID
-app.get('/api/news/:id', async (req, res) => {
+async function getArticleById(req, res) {
   try {
     const { id } = req.params;
     const userId = req.headers['x-user-id'] || req.query.userId; // Get userId from header or query
@@ -185,10 +125,10 @@ app.get('/api/news/:id', async (req, res) => {
     console.error('Error fetching article:', error);
     res.status(500).json({ error: 'Failed to fetch article' });
   }
-});
+}
 
 // Get similar articles using Redis Vector Search (with pagination)
-app.get('/api/news/:id/similar', async (req, res) => {
+async function getSimilarArticles(req, res) {
   try {
     console.log(req.params);
     const { id } = req.params;
@@ -208,10 +148,10 @@ app.get('/api/news/:id/similar', async (req, res) => {
     console.error('Error fetching similar articles:', error);
     res.status(500).json({ error: 'Failed to fetch similar articles' });
   }
-});
+}
 
 // Get all news articles (with pagination)
-app.get('/api/news', async (req, res) => {
+async function getAllNews(req, res) {
   try {
     console.log("Getting paginated news articles");
     const { page, limit, offset } = getPaginationParams(req);
@@ -230,10 +170,10 @@ app.get('/api/news', async (req, res) => {
     console.error('Error fetching news:', error);
     res.status(500).json({ error: 'Failed to fetch news' });
   }
-});
+}
 
 // Get available topics
-app.get('/api/topics', async (req, res) => {
+async function getTopics(req, res) {
   const topics = [
     'India',
     'Technology', 
@@ -246,16 +186,16 @@ app.get('/api/topics', async (req, res) => {
     'Health'
   ];
   res.json(topics);
-});
+}
 
 // Get available sentiments
-app.get('/api/sentiments', async (req, res) => {
+async function getSentiments(req, res) {
   const sentiments = ['positive', 'negative', 'neutral'];
   res.json(sentiments);
-});
+}
 
 // Get available sources (with pagination)
-app.get('/api/sources', async (req, res) => {
+async function getSources(req, res) {
   try {
     const sources = await getAllSources();
     res.json(sources);
@@ -273,10 +213,10 @@ app.get('/api/sources', async (req, res) => {
       }
     });
   }
-});
+}
 
 // Generate unique user ID endpoint
-app.post('/api/user/generate-id', (req, res) => {
+async function generateUserId(req, res) {
   try {
     const userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     res.json({ userId });
@@ -284,10 +224,10 @@ app.post('/api/user/generate-id', (req, res) => {
     console.error('Error generating user ID:', error);
     res.status(500).json({ error: 'Failed to generate user ID' });
   }
-});
+}
 
 // Store user preferences
-app.post('/api/user/:userId/preferences', async (req, res) => {
+async function storeUserPreferencesHandler(req, res) {
   try {
     const { userId } = req.params;
 
@@ -317,10 +257,10 @@ app.post('/api/user/:userId/preferences', async (req, res) => {
     console.error('Error storing user preferences:', error);
     res.status(500).json({ error: 'Failed to store preferences' });
   }
-});
+}
 
 // Get user preferences
-app.get('/api/user/:userId/preferences', async (req, res) => {
+async function getUserPreferencesHandler(req, res) {
   try {
     const { userId } = req.params;
     const userPrefs = await getUserPreferences(userId);
@@ -334,10 +274,10 @@ app.get('/api/user/:userId/preferences', async (req, res) => {
     console.error('Error fetching user preferences:', error);
     res.status(500).json({ error: 'Failed to fetch preferences' });
   }
-});
+}
 
 // Update user preferences
-app.put('/api/user/:userId/preferences', async (req, res) => {
+async function updateUserPreferencesHandler(req, res) {
   try {
     const { userId } = req.params;
     const preferences = req.body.topics;
@@ -365,10 +305,10 @@ app.put('/api/user/:userId/preferences', async (req, res) => {
     console.error('Error updating user preferences:', error);
     res.status(500).json({ error: 'Failed to update preferences' });
   }
-});
+}
 
 // Get personalized news feed
-app.get('/api/user/:userId/personalized-news', async (req, res) => {
+async function getPersonalizedNewsHandler(req, res) {
   try {
     const { userId } = req.params;
     const { page, limit, offset } = getPaginationParams(req);
@@ -387,11 +327,10 @@ app.get('/api/user/:userId/personalized-news', async (req, res) => {
     console.error('Error fetching personalized news:', error);
     res.status(500).json({ error: 'Failed to fetch personalized news' });
   }
-});
+}
 
 // Get personalized news with additional filters
-// Get personalized news with additional filters
-app.get('/api/user/:userId/personalized-news/search', async (req, res) => {
+async function getPersonalizedNewsSearchHandler(req, res) {
   try {
     const { userId } = req.params;
     const { q, sentiment, source } = req.query;
@@ -418,10 +357,9 @@ app.get('/api/user/:userId/personalized-news/search', async (req, res) => {
     console.error('Error fetching personalized search results:', error);
     res.status(500).json({ error: 'Failed to fetch personalized search results' });
   }
-});
+}
 
-
-app.get('/api/getSimiliarStats/:id', async (req, res) => {
+async function getSimilarStats(req, res) {
   try {
     const { id } = req.params;
     const stats = await getSimilarArticleCacheStats(id);
@@ -430,9 +368,9 @@ app.get('/api/getSimiliarStats/:id', async (req, res) => {
     console.error('Error fetching similar article cache stats:', error);
     res.status(500).json({ error: 'Failed to fetch similar article cache stats' });
   }
-})
+}
 
-app.get('/api/clearSimilarArticleCache/:id', async (req, res) => {
+async function clearSimilarCache(req, res) {
   try {
     const { id } = req.params;
     await clearSimilarArticleCache(id);
@@ -441,15 +379,30 @@ app.get('/api/clearSimilarArticleCache/:id', async (req, res) => {
     console.error('Error clearing similar article cache:', error);
     res.status(500).json({ error: 'Failed to clear similar article cache' });
   }
-})
+}
 
 // Health check
-app.get('/api/health', (req, res) => {
+async function healthCheck(req, res) {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
-});
+}
 
-app.listen(PORT, () => {
-  console.log(`API server running on port ${PORT}`);
-});
-
-module.exports = app;
+module.exports = {
+  getNewsByTopic,
+  getNewsBySentiment,
+  searchNews: searchNewsHandler,
+  getArticleById,
+  getSimilarArticles,
+  getAllNews,
+  getTopics,
+  getSentiments,
+  getSources,
+  generateUserId,
+  storeUserPreferences: storeUserPreferencesHandler,
+  getUserPreferences: getUserPreferencesHandler,
+  updateUserPreferences: updateUserPreferencesHandler,
+  getPersonalizedNews: getPersonalizedNewsHandler,
+  getPersonalizedNewsSearch: getPersonalizedNewsSearchHandler,
+  getSimilarStats,
+  clearSimilarCache,
+  healthCheck
+};

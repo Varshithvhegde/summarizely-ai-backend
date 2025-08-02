@@ -6,12 +6,12 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "cache:stats": "node clearCache.js --stats",
-    "cache:clear": "node clearCache.js --clear",
-    "cache:force": "node clearCache.js --force",
-    "cache:nuclear": "node clearCache.js --nuclear",
-    "cache:complete-stats": "node clearCache.js --complete-stats",
-    "cache:help": "node clearCache.js --help"
+    "cache:stats": "node src/scripts/clearCache.js --stats",
+    "cache:clear": "node src/scripts/clearCache.js --clear",
+    "cache:force": "node src/scripts/clearCache.js --force",
+    "cache:nuclear": "node src/scripts/clearCache.js --nuclear",
+    "cache:complete-stats": "node src/scripts/clearCache.js --complete-stats",
+    "cache:help": "node src/scripts/clearCache.js --help"
   },
   "keywords": [],
   "author": "",

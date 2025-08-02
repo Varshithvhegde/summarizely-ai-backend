@@ -1,173 +1,172 @@
-# News Summarizer with AI
+# News Summarization Backend
 
-A real-time news summarization application that fetches news from NewsAPI, summarizes articles using Google Gemini AI, and displays them in a beautiful React frontend.
+A Node.js backend application for news summarization with AI-powered features, Redis caching, and vector search capabilities.
 
-## 🚀 Features
-
-- **Real-time News Fetching** - Automatically fetches latest news every 10 minutes
-- **AI-Powered Summarization** - Uses Google Gemini 2.0 Flash for intelligent article summaries
-- **Sentiment Analysis** - Automatically analyzes article sentiment (positive/negative/neutral)
-- **Beautiful UI** - Modern, responsive React frontend with smooth animations
-- **Redis Storage** - Fast, scalable storage with Redis Stack
-- **Real-time Updates** - Live news updates with refresh functionality
-
-## 🏗️ Architecture
+## Project Structure
 
 ```
-Frontend (React + Vite) ←→ Backend API (Express) ←→ Redis Stack
-                                    ↓
-                            NewsAPI + Gemini AI
+backend/
+├── src/
+│   ├── controllers/          # Request handlers
+│   │   └── newsController.js
+│   ├── routes/              # Route definitions
+│   │   └── newsRoutes.js
+│   ├── services/            # Business logic and external services
+│   │   ├── redisService.js
+│   │   ├── geminiService.js
+│   │   └── newsFetcherService.js
+│   ├── middleware/          # Express middleware
+│   │   ├── errorHandler.js
+│   │   └── logger.js
+│   ├── utils/              # Utility functions
+│   │   └── pagination.js
+│   ├── config/             # Configuration files
+│   │   └── database.js
+│   ├── scripts/            # Management scripts
+│   │   ├── clearAllCache.js
+│   │   ├── clearCache.js
+│   │   ├── clearNews.js
+│   │   └── deleteSearchIndex.js
+│   └── app.js              # Main Express application
+├── docs/                   # Documentation
+│   ├── README.md
+│   └── CACHE_MANAGEMENT.md
+├── logs/                   # Log files
+├── index.js                # Application entry point
+├── package.json
+└── .env                    # Environment variables
 ```
 
-## 📁 Project Structure
+## Features
 
-```
-news_summarise/
-├── backend/                 # Node.js backend
-│   ├── index.js            # Main news processing script
-│   ├── api.js              # Express API server
-│   ├── newsFetcher.js      # NewsAPI integration
-│   ├── geminiClient.js     # Google Gemini AI integration
-│   ├── redisClient.js      # Redis connection & operations
-│   └── package.json
-├── frontend/               # React frontend
-│   ├── src/
-│   │   ├── App.jsx         # Main React component
-│   │   └── App.css         # Styling
-│   └── package.json
-└── README.md
-```
+- **AI-Powered News Summarization** - Uses Gemini AI for content analysis
+- **Redis Vector Search** - Semantic similarity search with Redis 8
+- **Personalized News Feed** - User preference-based recommendations
+- **Comprehensive Caching** - Multi-layer caching with Redis
+- **RESTful API** - Well-structured API endpoints
+- **Pagination Support** - Efficient data pagination
+- **Error Handling** - Robust error management
+- **Logging** - Request/response logging
 
-## 🛠️ Setup Instructions
+## Quick Start
 
 ### Prerequisites
+- Node.js 16+
+- Redis 8+
+- Gemini API key
 
-- Node.js (v18 or higher)
-- Redis Stack (for data storage)
-- NewsAPI key (free at [newsapi.org](https://newsapi.org))
-- Google Gemini API key (free at [Google AI Studio](https://makersuite.google.com/app/apikey))
-
-### 1. Backend Setup
-
+### Installation
 ```bash
-cd backend
-
-# Install dependencies
 npm install
-
-# Create .env file
-echo "NEWSAPI_KEY=your_newsapi_key
-GEMINI_API_KEY=your_gemini_api_key
-REDIS_URL=redis://localhost:6379
-PORT=3001" > .env
-
-# Start Redis Stack (if not running)
-# Download from: https://redis.io/docs/stack/
-
-# Start the news processor
-node index.js
-
-# In another terminal, start the API server
-node api.js
 ```
 
-### 2. Frontend Setup
-
-```bash
-cd frontend
-
-# Install dependencies
-npm install
-
-# Start development server
-npm run dev
-```
-
-### 3. Access the Application
-
-- **Frontend**: http://localhost:5173
-- **Backend API**: http://localhost:3001
-
-## 🔧 Configuration
-
-### Environment Variables
-
-Create a `.env` file in the `backend/` directory:
-
+### Environment Setup
+Create a `.env` file:
 ```env
-NEWSAPI_KEY=your_newsapi_key_here
-GEMINI_API_KEY=your_gemini_api_key_here
 REDIS_URL=redis://localhost:6379
+GEMINI_API_KEY=your_gemini_api_key
 PORT=3001
 ```
 
-### API Endpoints
+### Running the Application
+```bash
+# Development
+npm run dev
 
+# Production
+npm start
+```
+
+## API Endpoints
+
+### News Endpoints
 - `GET /api/news` - Get all news articles
-- `GET /api/news/sentiment/:sentiment` - Get news by sentiment
+- `GET /api/news/:id` - Get specific article
+- `GET /api/news/:id/similar` - Get similar articles
+- `GET /api/news/search` - Search articles
+- `GET /api/news/topic/:topic` - Get articles by topic
+- `GET /api/news/sentiment/:sentiment` - Get articles by sentiment
+
+### User Endpoints
+- `POST /api/user/generate-id` - Generate user ID
+- `POST /api/user/:userId/preferences` - Store user preferences
+- `GET /api/user/:userId/preferences` - Get user preferences
+- `PUT /api/user/:userId/preferences` - Update user preferences
+- `GET /api/user/:userId/personalized-news` - Get personalized news
+- `GET /api/user/:userId/personalized-news/search` - Search personalized news
+
+### Metadata Endpoints
+- `GET /api/topics` - Get available topics
+- `GET /api/sentiments` - Get available sentiments
+- `GET /api/sources` - Get available sources
+
+### Admin Endpoints
+- `GET /api/getSimiliarStats/:id` - Get similar articles stats
+- `GET /api/clearSimilarArticleCache/:id` - Clear similar articles cache
 - `GET /api/health` - Health check
 
-## 🎨 UI Features
+## Cache Management
 
-- **Responsive Design** - Works on desktop, tablet, and mobile
-- **Sentiment Indicators** - Color-coded sentiment badges with icons
-- **Real-time Refresh** - Manual refresh button with loading states
-- **Error Handling** - Graceful error messages and fallback data
-- **Smooth Animations** - Loading spinners and hover effects
+### Available Scripts
+```bash
+# Show cache statistics
+npm run cache:stats
 
-## 🔄 How It Works
+# Clear all cache (with confirmation)
+npm run cache:clear
 
-1. **News Fetching**: Backend fetches news from NewsAPI every 10 minutes
-2. **AI Processing**: Each article is sent to Gemini for summarization and sentiment analysis
-3. **Storage**: Processed articles are stored in Redis Stack as JSON
-4. **API Serving**: Express server provides REST API endpoints
-5. **Frontend Display**: React app fetches and displays news with beautiful UI
+# Force clear all cache (no confirmation)
+npm run cache:force
 
-## 🚀 Deployment
+# ☢️  NUCLEAR: Clear everything in Redis
+npm run cache:nuclear
 
-### Backend Deployment
-- Deploy to platforms like Heroku, Railway, or DigitalOcean
-- Set up Redis Cloud or AWS ElastiCache for Redis
-- Configure environment variables
+# Show complete Redis statistics
+npm run cache:complete-stats
 
-### Frontend Deployment
-- Build: `npm run build`
-- Deploy to Vercel, Netlify, or any static hosting
+# Show help
+npm run cache:help
+```
 
-## 🤝 Contributing
+## Development
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
+### Code Organization
+- **Controllers**: Handle HTTP requests and responses
+- **Services**: Contain business logic and external service interactions
+- **Routes**: Define API endpoints and their handlers
+- **Middleware**: Request processing and error handling
+- **Utils**: Reusable utility functions
+- **Config**: Application configuration
+- **Scripts**: Management and maintenance scripts
 
-## 📝 License
+### Adding New Features
+1. Create service functions in `src/services/`
+2. Add controller functions in `src/controllers/`
+3. Define routes in `src/routes/`
+4. Add middleware if needed in `src/middleware/`
 
-MIT License - feel free to use this project for your own applications!
+## Redis Features Used
 
-## 🆘 Troubleshooting
+- **Vector Search**: Semantic similarity with KNN
+- **JSON Storage**: Article data storage
+- **Caching**: Multi-layer caching system
+- **Search Indexing**: Full-text search capabilities
+- **Bloom Filters**: Efficient duplicate detection
+- **LRU Management**: Cache eviction strategies
 
-### Common Issues
+## Monitoring
 
-1. **Redis Connection Error**
-   - Ensure Redis Stack is running
-   - Check Redis URL in .env file
+- Request/response logging
+- Error tracking
+- Cache performance metrics
+- Memory usage monitoring
+- API response times
 
-2. **API Key Errors**
-   - Verify NewsAPI and Gemini API keys are correct
-   - Check API quotas and limits
+## Documentation
 
-3. **Frontend Not Loading Data**
-   - Ensure backend API server is running on port 3001
-   - Check browser console for CORS errors
+- [Cache Management Guide](docs/CACHE_MANAGEMENT.md)
+- [API Documentation](docs/README.md)
 
-### Getting Help
+## License
 
-- Check the console logs for detailed error messages
-- Verify all environment variables are set correctly
-- Ensure all dependencies are installed
-
----
-
-**Happy coding! 🎉**
+ISC 

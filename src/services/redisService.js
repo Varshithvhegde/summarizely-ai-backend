@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { createClient } = require('redis');
-const { generateEmbedding } = require('./geminiClient'); 
+const { generateEmbedding } = require('./geminiService'); 
 const redis = createClient({ url: process.env.REDIS_URL });
 redis.connect();
 
@@ -1106,14 +1106,12 @@ async function findSimilarArticles(articleId, limit = 6, offset = 0, options = {
       forceRefresh = false,
       cacheTimeout = 3600, // 1 hour default
       includeCacheStats = false,
-      useBloomFilter = true,
       enablePipeline = true
     } = options;
-
+    
     // Generate cache key with parameters for better granularity
     const cacheKey = `similar:${articleId}:${limit}:${offset}`;
     const metaCacheKey = `similar_meta:${articleId}`;
-    const bloomKey = `similar_bloom:${articleId}`;
     const statsKey = `similar_stats:${articleId}`;
 
     // Check if article exists using Redis 8's improved EXISTS with pipeline
@@ -1216,30 +1214,6 @@ async function findSimilarArticles(articleId, limit = 6, offset = 0, options = {
     if (!targetArticle) {
       console.log('Article not found:', articleId);
       return { articles: [], totalCount: 0, cached: false };
-    }
-
-    // Use Redis 8's Bloom Filter for efficient duplicate checking (if enabled)
-    if (useBloomFilter) {
-      try {
-        // Create bloom filter if it doesn't exist
-        await redis.bf.reserve(bloomKey, 0.01, 1000).catch(() => {
-          // Bloom filter might already exist
-        });
-        console.log('Bloom filter created');
-        
-        // Check if we've processed this article recently
-        const recentlyProcessed = await redis.bf.exists(bloomKey, articleId);
-        console.log('Recently processed:', recentlyProcessed);
-        if (recentlyProcessed && !forceRefresh) {
-          console.log('Article recently processed, using cached computation');
-        }
-        
-        // Add to bloom filter
-        await redis.bf.add(bloomKey, articleId);
-        await redis.expire(bloomKey, cacheTimeout);
-      } catch (bloomError) {
-        console.log('Bloom filter not available, continuing without it');
-      }
     }
 
     // Determine search strategy
@@ -1929,7 +1903,7 @@ async function getAllArticles(limit = 10, offset = 0) {
 
     // Cache the results for 5 minutes
     await redis.set(cacheKey, JSON.stringify(response), 'EX', 300);
-    
+    await redis.expire(cacheKey, 300);
     return response;
 
   } catch (error) {
