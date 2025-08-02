@@ -3,7 +3,15 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "cache:stats": "node clearCache.js --stats",
+    "cache:clear": "node clearCache.js --clear",
+    "cache:force": "node clearCache.js --force",
+    "cache:nuclear": "node clearCache.js --nuclear",
+    "cache:complete-stats": "node clearCache.js --complete-stats",
+    "cache:help": "node clearCache.js --help"
   },
   "keywords": [],
   "author": "",

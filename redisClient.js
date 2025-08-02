@@ -1026,7 +1026,8 @@ async function searchArticlesByTopic(topic, limit = 10, offset = 0) {
       `@title:${topic}`,
       `@description:${topic}`,
       `@content:${topic}`,
-      `@summary:${topic}`
+      `@summary:${topic}`,
+      `@keywords:${topic}`
     ].join(' | ');
     
     const query = `(${searchQuery})`;
@@ -1537,7 +1538,7 @@ async function advancedTextSimilarity(targetArticle, limit) {
     const queryParts = searchTerms.map(term => {
       // Escape special characters and use simpler syntax
       const escapedTerm = term.replace(/[^\w\s]/g, '');
-      return `@title|summary|description:(${escapedTerm})`;
+      return `@title|summary|description|keywords:(${escapedTerm})`;
     });
 
     const query = `(${queryParts.join(' | ')}) -@article_id:{${targetArticle.id}}`;
@@ -1577,7 +1578,7 @@ async function semanticSimilarity(targetArticle, limit) {
 
     if (escapedTerms.length === 0) return [];
 
-    const query = `(@title|summary|description:(${escapedTerms.join(' | ')})) -@article_id:{${targetArticle.id}}`;
+    const query = `(@title|summary|description|keywords:(${escapedTerms.join(' | ')})) -@article_id:{${targetArticle.id}}`;
 
     const results = await redis.ft.search(
       'idx:news',
@@ -1891,8 +1892,16 @@ async function fallbackSimilarSearch(articleId, limit = 6, offset = 0) {
 
 // Get all articles (optimized with Redis SCAN and pagination)
 async function getAllArticles(limit = 10, offset = 0) {
+  // Check cache first
+  const cacheKey = `all_articles:${limit}:${offset}`;
   try {
-    // Get total count first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      console.log("cached");
+      return JSON.parse(cached);
+    }
+
+    // If not in cache, fetch from Redis search
     const countResults = await redis.ft.search(
       'idx:news',
       '*',
@@ -1913,10 +1922,16 @@ async function getAllArticles(limit = 10, offset = 0) {
       }
     );
     
-    return {
+    const response = {
       articles: results.documents.map(doc => doc.value),
       totalCount
     };
+
+    // Cache the results for 5 minutes
+    await redis.set(cacheKey, JSON.stringify(response), 'EX', 300);
+    
+    return response;
+
   } catch (error) {
     console.error('Error getting all articles:', error);
     
@@ -1950,7 +1965,12 @@ async function getAllArticles(limit = 10, offset = 0) {
       // Sort by published date
       articles.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
       
-      return { articles, totalCount };
+      const response = { articles, totalCount };
+
+      // Cache fallback results for 5 minutes
+      await redis.set(cacheKey, JSON.stringify(response), 'EX', 300);
+
+      return response;
     } catch (fallbackError) {
       console.error('Error in fallback getAllArticles:', fallbackError);
       return { articles: [], totalCount: 0 };
@@ -1991,6 +2011,173 @@ async function getAllSources() {
   }
 }
 
+// Search news with custom query (with pagination)
+async function searchNewsWithQuery(query, sentiment, source, limit = 10, offset = 0) {
+  try {
+    // Build query parts for regular search
+    const queryParts = [];
+    
+    if (query) {
+      // Search in multiple fields with OR logic
+      const searchQuery = [
+        `@title:${query}`,
+        `@description:${query}`,
+        `@content:${query}`,
+        `@summary:${query}`,
+        `@keywords:${query}`,
+      ].join(' | ');
+      queryParts.push(`(${searchQuery})`);
+    }
+    
+    if (sentiment) {
+      queryParts.push(`@sentiment:{${sentiment}}`);
+    }
+    
+    if (source) {
+      queryParts.push(`@source:{${source}}`);
+    }
+    
+    // Combine all query parts with AND logic
+    const finalQuery = queryParts.join(' ');
+    
+    // Get total count first
+    const countResults = await redis.ft.search(
+      'idx:news',
+      finalQuery,
+      { 
+        LIMIT: { from: 0, size: 0 } // Only get count
+      }
+    );
+    
+    const totalCount = countResults.total || 0;
+    
+    // Get paginated results
+    const results = await redis.ft.search(
+      'idx:news',
+      finalQuery,
+      { 
+        SORTBY: { BY: 'publishedAt', DIRECTION: 'DESC' }, 
+        LIMIT: { from: offset, size: limit } 
+      }
+    );
+
+    const articles = results.documents.map(doc => doc.value);
+    
+    return {
+      articles,
+      totalCount
+    };
+  } catch (error) {
+    console.error('Error searching news with query:', error);
+    return { articles: [], totalCount: 0 };
+  }
+}
+
+// Search news with topic intersection
+async function searchNewsWithTopicIntersection(query, sentiment, source, topic, limit = 10, offset = 0) {
+  try {
+    // Build search query (excluding topic)
+    const queryParts = [];
+    
+    if (query) {
+      const searchQuery = [
+        `@title:${query}`,
+        `@description:${query}`,
+        `@content:${query}`,
+        `@summary:${query}`,
+        `@keywords:${query}`,
+      ].join(' | ');
+      queryParts.push(`(${searchQuery})`);
+    }
+    
+    if (sentiment) {
+      queryParts.push(`@sentiment:{${sentiment}}`);
+    }
+    
+    if (source) {
+      queryParts.push(`@source:{${source}}`);
+    }
+    
+    const searchQuery = queryParts.length > 0 ? queryParts.join(' ') : '*';
+    
+    // Get all search results (we need all for intersection)
+    const searchResults = await redis.ft.search(
+      'idx:news',
+      searchQuery,
+      { 
+        SORTBY: { BY: 'publishedAt', DIRECTION: 'DESC' },
+        LIMIT: { from: 0, size: 1000 } // Get more results for better intersection
+      }
+    );
+    
+    // Get all topic results
+    const topicResults = await searchArticlesByTopic(topic, 1000, 0);
+    
+    // Create sets for efficient intersection
+    const searchIds = new Set(searchResults.documents.map(doc => doc.value.id));
+    const topicIds = new Set(topicResults.articles.map(article => article.id));
+    
+    // Find intersection
+    const intersectionIds = new Set();
+    for (const id of searchIds) {
+      if (topicIds.has(id)) {
+        intersectionIds.add(id);
+      }
+    }
+    
+    // Convert back to full articles and sort by publishedAt
+    const intersectionArticles = searchResults.documents
+      .map(doc => doc.value)
+      .filter(article => intersectionIds.has(article.id))
+      .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
+    
+    // Apply pagination to intersection results
+    const totalCount = intersectionArticles.length;
+    const paginatedArticles = intersectionArticles.slice(offset, offset + limit);
+    
+    return {
+      articles: paginatedArticles,
+      totalCount
+    };
+  } catch (error) {
+    console.error('Error in search with topic intersection:', error);
+    return { articles: [], totalCount: 0 };
+  }
+}
+
+// Comprehensive search function that handles all search scenarios
+async function searchNews(filters, pagination) {
+  try {
+    const { q, sentiment, source, topic } = filters;
+    const { page, limit, offset } = pagination;
+    
+    // Handle different filter combinations
+    const hasSearchFilters = q || sentiment || source;
+    const hasTopic = topic;
+    
+    // Case 1: Only topic is present - use topic search
+    if (hasTopic && !hasSearchFilters) {
+      return await searchArticlesByTopic(topic, limit, offset);
+    }
+    
+    // Case 2: Both topic and search filters are present - use intersection approach
+    if (hasTopic && hasSearchFilters) {
+      return await searchNewsWithTopicIntersection(q, sentiment, source, topic, limit, offset);
+    }
+    
+    // Case 3: Only search filters are present (no topic) - use regular search
+    if (hasSearchFilters && !hasTopic) {
+      return await searchNewsWithQuery(q, sentiment, source, limit, offset);
+    }
+    
+    // Case 4: No filters provided - return all articles
+    return await getAllArticles(limit, offset);
+  } catch (error) {
+    console.error('Error in comprehensive search:', error);
+    return { articles: [], totalCount: 0 };
+  }
+}
+
 module.exports = {
   redis,
   searchArticlesByTopic,
@@ -2010,5 +2197,9 @@ module.exports = {
   getPersonalizedNews,
   getPersonalizedNewsSearch,
   getAllSources,
-  markArticleAsRead
+  markArticleAsRead,
+  // Add the new search functions
+  searchNewsWithQuery,
+  searchNewsWithTopicIntersection,
+  searchNews
 };

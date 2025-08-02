@@ -4,16 +4,21 @@ const { GoogleGenAI } = require('@google/genai');
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 async function summarizeAndAnalyze(title, content) {
-  const prompt = `Summarize the following news article in 2-3 sentences and provide its sentiment (positive, negative, or neutral) and keywords used in the article.
+  const prompt = `You are an intelligent assistant helping categorize news articles.
+  
+Given the following news content, do the following:
+1. Summarize it in 2-3 sentences.
+2. Determine its sentiment (positive, negative, or neutral).
+3. Generate 10-15 relevant keywords or key phrases for search and categorization. These keywords should reflect the *topic*, *context*, and *implications*, even if they are *not directly mentioned* in the article. Include related people, events, organizations, or terms.
 
 Title: ${title}
 Content: ${content}
 
-Respond in JSON:
+Respond in strict JSON format like this:
 {
   "summary": "...",
   "sentiment": "...",
-  "keywords": ["..."]
+  "keywords": ["...", "...", "..."]
 }`;
 
   try {
@@ -21,24 +26,24 @@ Respond in JSON:
       model: "gemini-2.0-flash",
       contents: prompt,
     });
-    
-    const text = response.text;
-    
-    // Clean up the response - remove markdown code blocks if present
-    let jsonText = text.trim();
-    if (jsonText.startsWith('```json')) {
-      jsonText = jsonText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-    } else if (jsonText.startsWith('```')) {
-      jsonText = jsonText.replace(/^```\s*/, '').replace(/\s*```$/, '');
+
+    let text = response.text.trim();
+
+    // Remove markdown code block if present
+    if (text.startsWith('```json')) {
+      text = text.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+    } else if (text.startsWith('```')) {
+      text = text.replace(/^```\s*/, '').replace(/\s*```$/, '');
     }
-    
-    return JSON.parse(jsonText);
+
+    return JSON.parse(text);
   } catch (e) {
     console.error('Error calling Gemini API:', e);
     console.error('Raw response:', response?.text);
-    return { summary: '', sentiment: 'neutral' };
+    return { summary: '', sentiment: 'neutral', keywords: [] };
   }
 }
+
 
 // Generate an embedding vector for a given text using Gemini
 async function generateEmbedding(text) {

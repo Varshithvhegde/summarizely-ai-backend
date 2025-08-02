@@ -18,7 +18,11 @@ const {
   clearPersonalizedCache,
   getPersonalizedNewsSearch,
   getAllSources,
-  markArticleAsRead
+  markArticleAsRead,
+  // Add the new search functions
+  searchNewsWithQuery,
+  searchNewsWithTopicIntersection,
+  searchNews
 } = require('./redisClient');
 
 
@@ -123,88 +127,15 @@ app.get('/api/news/sentiment/:sentiment', async (req, res) => {
 // Search news with custom query (with pagination)
 app.get('/api/news/search', async (req, res) => {
   try {
-    // console.log(req.query);
     const { q, sentiment, source, topic } = req.query;
     const { page, limit, offset } = getPaginationParams(req);
     
-    // Handle different filter combinations
-    const hasSearchFilters = q || sentiment || source;
-    const hasTopic = topic;
+    // Use the comprehensive search function from redisClient
+    const result = await searchNews(
+      { q, sentiment, source, topic },
+      { page, limit, offset }
+    );
     
-    // Case 1: Only topic is present - use topic search
-    if (hasTopic && !hasSearchFilters) {
-      const result = await searchArticlesByTopic(topic, limit, offset);
-      const response = createPaginatedResponse(
-        result.articles, 
-        result.totalCount, 
-        page, 
-        limit, 
-        req
-      );
-      return res.json(response);
-    }
-    
-    // Case 2: Both topic and search filters are present - use intersection approach
-    if (hasTopic && hasSearchFilters) {
-      return await handleSearchWithTopic(req, res, { q, sentiment, source, topic }, { page, limit, offset });
-    }
-    
-    // Case 3: Only search filters are present (no topic) - use regular search
-    if (hasSearchFilters && !hasTopic) {
-      // Build query parts for regular search
-      const queryParts = [];
-      
-      if (q) {
-        // Search in multiple fields with OR logic
-        const searchQuery = [
-          `@title:${q}`,
-          `@description:${q}`,
-          `@content:${q}`,
-          `@summary:${q}`,
-        ].join(' | ');
-        queryParts.push(`(${searchQuery})`);
-      }
-      
-      if (sentiment) {
-        queryParts.push(`@sentiment:{${sentiment}}`);
-      }
-      
-      if (source) {
-        queryParts.push(`@source:{${source}}`);
-      }
-      
-      // Combine all query parts with AND logic
-      const query = queryParts.join(' ');
-      
-      // Get total count first
-      const countResults = await redis.ft.search(
-        'idx:news',
-        query,
-        { 
-          LIMIT: { from: 0, size: 0 } // Only get count
-        }
-      );
-      
-      const totalCount = countResults.total || 0;
-      
-      // Get paginated results
-      const results = await redis.ft.search(
-        'idx:news',
-        query,
-        { 
-          SORTBY: { BY: 'publishedAt', DIRECTION: 'DESC' }, 
-          LIMIT: { from: offset, size: limit } 
-        }
-      );
-
-      const articles = results.documents.map(doc => doc.value);
-      const response = createPaginatedResponse(articles, totalCount, page, limit, req);
-      
-      return res.json(response);
-    }
-    
-    // Case 4: No filters provided - return all articles (same as /api/news)
-    const result = await getAllArticles(limit, offset);
     const response = createPaginatedResponse(
       result.articles, 
       result.totalCount, 
@@ -220,78 +151,7 @@ app.get('/api/news/search', async (req, res) => {
   }
 });
 
-// Helper function to handle search with topic intersection
-async function handleSearchWithTopic(req, res, filters, pagination) {
-  try {
-    const { q, sentiment, source, topic } = filters;
-    const { page, limit, offset } = pagination;
-    
-    // Build search query (excluding topic)
-    const queryParts = [];
-    
-    if (q) {
-      const searchQuery = [
-        `@title:${q}`,
-        `@description:${q}`,
-        `@content:${q}`,
-        `@summary:${q}`,
-      ].join(' | ');
-      queryParts.push(`(${searchQuery})`);
-    }
-    
-    if (sentiment) {
-      queryParts.push(`@sentiment:{${sentiment}}`);
-    }
-    
-    if (source) {
-      queryParts.push(`@source:{${source}}`);
-    }
-    
-    const searchQuery = queryParts.length > 0 ? queryParts.join(' ') : '*';
-    
-    // Get all search results (we need all for intersection)
-    const searchResults = await redis.ft.search(
-      'idx:news',
-      searchQuery,
-      { 
-        SORTBY: { BY: 'publishedAt', DIRECTION: 'DESC' },
-        LIMIT: { from: 0, size: 1000 } // Get more results for better intersection
-      }
-    );
-    
-    // Get all topic results
-    const topicResults = await searchArticlesByTopic(topic, 1000, 0);
-    
-    // Create sets for efficient intersection
-    const searchIds = new Set(searchResults.documents.map(doc => doc.value.id));
-    const topicIds = new Set(topicResults.articles.map(article => article.id));
-    
-    // Find intersection
-    const intersectionIds = new Set();
-    for (const id of searchIds) {
-      if (topicIds.has(id)) {
-        intersectionIds.add(id);
-      }
-    }
-    
-    // Convert back to full articles and sort by publishedAt
-    const intersectionArticles = searchResults.documents
-      .map(doc => doc.value)
-      .filter(article => intersectionIds.has(article.id))
-      .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
-    
-    // Apply pagination to intersection results
-    const totalCount = intersectionArticles.length;
-    const paginatedArticles = intersectionArticles.slice(offset, offset + limit);
-    
-    const response = createPaginatedResponse(paginatedArticles, totalCount, page, limit, req);
-    
-    res.json(response);
-  } catch (error) {
-    console.error('Error in search with topic intersection:', error);
-    res.status(500).json({ error: 'Failed to search news with topic' });
-  }
-}
+
 
 
 
