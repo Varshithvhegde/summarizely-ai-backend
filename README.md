@@ -1,4 +1,4 @@
-# Summarizely AI Backend - News Aggregation & AI Summarization API
+# NewsHub Backend - News Aggregation & AI Summarization API
 
 A high-performance Node.js backend API for news aggregation, AI-powered summarization, and personalized content delivery. Built with Express.js, Redis, and Google Gemini AI.
 
