@@ -24,6 +24,7 @@ const corsOptions = {
       'http://localhost:3000',
       'http://localhost:5173',
       'https://newshub-henna.vercel.app',
+      'https://newshub-git-main-varshithvhegdes-projects.vercel.app',
       'https://newshub-frontend.vercel.app',
       'https://*.vercel.app'
     ];
@@ -42,7 +43,12 @@ const corsOptions = {
       callback(null, true);
     } else {
       console.log('CORS blocked origin:', origin);
-      callback(new Error('Not allowed by CORS'));
+      // For development, allow all origins
+      if (process.env.NODE_ENV === 'development') {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
     }
   },
   credentials: true,
