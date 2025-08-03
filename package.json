@@ -6,6 +6,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js",
     "dev": "node index.js",
+    "test:cors": "node test-cors.js",
     "cache:stats": "node src/scripts/clearCache.js --stats",
     "cache:clear": "node src/scripts/clearCache.js --clear",
     "cache:force": "node src/scripts/clearCache.js --force",
