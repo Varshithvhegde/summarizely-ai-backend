@@ -2434,5 +2434,9 @@ module.exports = {
   trackArticleMetrics,
   getArticleMetrics,
   getUserArticleHistory,
-  getTrendingArticles
+  getTrendingArticles,
+  // Add cache clearing functions
+  clearAllCacheExceptUser: require('./cacheClearService').clearAllCacheExceptUser,
+  clearSpecificCacheTypes: require('./cacheClearService').clearSpecificCacheTypes,
+  getCacheStatistics: require('./cacheClearService').getCacheStatistics
 };
